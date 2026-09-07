@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: foodops
+          POSTGRES_PASSWORD: ci-password
+          POSTGRES_DB: foodops_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U foodops -d foodops_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Two distinct databases on the same ephemeral service container, so the
+      # backend/tests/conftest.py isolation guard is genuinely exercised in CI
+      # too (not trivially satisfied by two identical values). Both live on
+      # the same throwaway Postgres instance created above.
+      DATABASE_URL: postgresql+psycopg://foodops:ci-password@localhost:5432/foodops_ci
+      TEST_DATABASE_URL: postgresql+psycopg://foodops:ci-password@localhost:5432/foodops_test
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Create dedicated test database
+        run: |
+          uv run python -c "
+          import psycopg
+          conn = psycopg.connect('postgresql://foodops:ci-password@localhost:5432/foodops_ci', autocommit=True)
+          conn.execute('CREATE DATABASE foodops_test')
+          "
+
+      - name: Ruff check
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Alembic upgrade (migration pipeline verification)
+        run: uv run alembic upgrade head
+
+      - name: Pytest
+        run: uv run pytest
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Vitest
+        run: npm run test -- --run
+
+      - name: Build
+        run: npm run build
