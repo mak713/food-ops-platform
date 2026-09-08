@@ -20,6 +20,10 @@ If implementation reveals a conflict, ambiguity, missing requirement, or technic
 
 Framework-specific implementation details may be chosen where the specification intentionally leaves them open.
 
+## Implementation Decision Addendum
+
+Implementation-level decisions made after the architecture freeze — filling gaps `docs/ARCHITECTURE_SPEC.md` explicitly left open, not redefining product/architecture requirements — are recorded in `docs/ARCHITECTURE_ADDENDUM.md`. Treat it as authoritative for the decisions it documents, with the same "do not silently deviate" discipline that applies to the main spec. If the two ever conflict, `docs/ARCHITECTURE_SPEC.md` governs.
+
 ## Development Workflow
 
 Development follows the implementation phases defined in the specification.
