@@ -1,13 +1,15 @@
+import os
 from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+import app.db.models  # noqa: F401
 from app.core.config import get_settings
 from app.db.base import Base
 
-# Phase 1 will import domain models here so Base.metadata is populated for
-# autogenerate. Phase 0 intentionally has no domain models yet.
+# Importing app.db.models (above) registers every domain model on Base.metadata
+# so autogenerate and target_metadata below see the full Phase 1 schema.
 target_metadata = Base.metadata
 
 config = context.config
@@ -15,10 +17,14 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Connection string comes from Settings (backend/.env), not from alembic.ini,
-# so there is exactly one source of truth for DATABASE_URL.
+# Connection string comes from Settings (backend/.env) by default, so there is one
+# source of truth for DATABASE_URL in normal (dev/CI) use. ALEMBIC_DATABASE_URL is
+# an explicit escape hatch for running migrations against a different database
+# programmatically — used by the schema-test suite to migrate TEST_DATABASE_URL
+# without ever touching DATABASE_URL.
 settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.database_url)
+database_url = os.environ.get("ALEMBIC_DATABASE_URL", settings.database_url)
+config.set_main_option("sqlalchemy.url", database_url)
 
 
 def run_migrations_offline() -> None:
