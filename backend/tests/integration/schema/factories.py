@@ -8,7 +8,7 @@ wants to trigger real constraint/FK evaluation.
 """
 
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
@@ -21,6 +21,7 @@ from app.db.enums import (
     ProductionRunStatus,
     ProductType,
 )
+from app.db.models.auth import AuthSession, PasswordResetToken
 from app.db.models.business import Business
 from app.db.models.cost import OrderCostAllocation
 from app.db.models.customer import Customer
@@ -86,6 +87,34 @@ def make_business_graph(session: Session, **overrides) -> Business:
     """Convenience: a User + their Business in one call."""
     user = make_user(session)
     return make_business(session, user, **overrides)
+
+
+def make_auth_session(session: Session, user: User, **overrides) -> AuthSession:
+    now = overrides.get("now", datetime.now(UTC))
+    obj = AuthSession(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        token_hash=overrides.get("token_hash", _unique("session-token-hash")),
+        csrf_token_hash=overrides.get("csrf_token_hash", _unique("csrf-token-hash")),
+        last_seen_at=now,
+        expires_at=overrides.get("expires_at", now + timedelta(days=7)),
+        revoked_at=overrides.get("revoked_at"),
+    )
+    session.add(obj)
+    return obj
+
+
+def make_password_reset_token(session: Session, user: User, **overrides) -> PasswordResetToken:
+    now = overrides.get("now", datetime.now(UTC))
+    obj = PasswordResetToken(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        token_hash=overrides.get("token_hash", _unique("reset-token-hash")),
+        expires_at=overrides.get("expires_at", now + timedelta(minutes=30)),
+        used_at=overrides.get("used_at"),
+    )
+    session.add(obj)
+    return obj
 
 
 def make_customer(session: Session, business: Business, **overrides) -> Customer:

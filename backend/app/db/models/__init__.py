@@ -2,6 +2,7 @@
 Alembic autogenerate and for migrations/env.py's target_metadata to see the full
 domain schema."""
 
+from app.db.models.auth import AuthSession, PasswordResetToken
 from app.db.models.business import Business
 from app.db.models.cost import OrderCostAllocation
 from app.db.models.customer import Customer
@@ -31,6 +32,7 @@ from app.db.models.surplus import (
 from app.db.models.user import User
 
 __all__ = [
+    "AuthSession",
     "Business",
     "Customer",
     "Ingredient",
@@ -40,6 +42,7 @@ __all__ = [
     "OrderCostAllocation",
     "OrderLine",
     "OrderStatusHistory",
+    "PasswordResetToken",
     "Payment",
     "Product",
     "ProductionIngredientRequirement",

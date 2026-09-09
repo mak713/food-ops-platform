@@ -36,6 +36,10 @@ Thumbs.db
 *.sqlite
 *.sqlite3
 
+# Phase 2 development mail outbox (OutboxFileMailer) — local dev-only emails,
+# including password-reset links/tokens; never committed.
+backend/.mail-outbox/
+
 # Playwright
 playwright-report/
 test-results/
