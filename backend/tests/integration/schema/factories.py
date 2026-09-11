@@ -263,6 +263,7 @@ def make_order(session: Session, business: Business, **overrides) -> Order:
         business_id=business.id,
         order_number=overrides.get("order_number", _unique("ORD")),
         status=overrides.get("status", OrderStatus.DRAFT),
+        customer_id=overrides.get("customer_id"),
     )
     session.add(obj)
     return obj

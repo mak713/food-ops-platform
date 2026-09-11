@@ -225,3 +225,84 @@ resource-by-ID → non-revealing 404" proof (Spec §10.5/17.12) is deferred to P
 tenant-owned resource reachable by ID exists (`Customer`) — Phase 2 instead establishes the
 reusable pattern (`app/core/tenant.py`'s `NotFoundError`) that Phase 3 applies. A throwaway
 by-ID endpoint was deliberately not added to Phase 2 solely to exercise that proof early.
+
+### ADR-099 — Tenant-Scoped Resource Lookup: Query-Level `(id, business_id)` Scoping
+
+`Customer` and `Product` are fetched through `app/core/tenant.py::get_owned_or_404` via their
+per-resource named wrappers (`get_customer_for_business`, `get_product_for_business`), matching
+the call-shape Spec §10.4 illustrates. Its `SELECT` itself is scoped by both `id` and
+`business_id` in one query (`select(model).where(model.id == id_, model.business_id ==
+business.id)`), never a bare primary-key fetch followed by a post-hoc ownership check. A row
+belonging to another tenant and a genuinely nonexistent row are structurally indistinguishable
+to this function — both produce zero rows from the same query and raise the identical
+`NotFoundError` (Spec §10.5) — so no downstream code path can ever hold a foreign-tenant row in
+memory, even transiently. `SellingOption` is not fetched through this generic helper — it uses
+the specialized `get_selling_option_for_product`, which scopes its own query by `(id,
+product_id, business_id)` together, so a selling option belonging to a different product *or* a
+different tenant is equally unreachable in a single query, given an already tenant-verified
+parent `Product`. List endpoints scope their own `WHERE business_id = ...` clause directly,
+never relying on post-fetch filtering. This is the reusable pattern every later by-ID resource
+router is expected to follow — a generic scoped-lookup helper for directly tenant-owned
+resources, and a specialized parent-scoped query for resources owned through a parent.
+
+### ADR-100 — Optimistic Concurrency: `version_id_col` Plus an Application-Level Pre-Check
+
+`Customer`, `Product`, and `SellingOption` (the three aggregates Spec §8.33 names as in scope
+for Phase 3) each declare `__mapper_args__ = {"version_id_col": cls.version}` via a
+per-class `@declared_attr.directive` — not on the shared `VersionMixin` itself, so `User`/
+`Business` are unaffected. This is SQLAlchemy's built-in optimistic-concurrency mechanism: every
+`UPDATE` is emitted as `... WHERE id = ? AND version = ?`, auto-incrementing `version` on
+success and raising `sqlalchemy.orm.exc.StaleDataError` if a concurrent write already moved the
+row. Every mutating request (`PATCH`, `POST .../archive`, `POST .../reactivate`, and `DELETE`'s
+query parameter) additionally carries a client-submitted `version`, which each service function
+compares against the freshly-loaded row's current value *before* mutating — this is the primary,
+common-case defense against a stale cross-request edit. The rarer within-transaction race that
+only the ORM-level mechanism can catch is translated by `commit_or_raise_stale` into the same
+`409 STALE_VERSION` `ApiError`, with the exact user-facing message Spec §17.8 specifies ("This
+record changed since you opened it. Refresh the latest version and review your changes before
+saving again."), so a caller cannot distinguish which of the two layers caught the conflict.
+Archiving/reactivating a resource that is already in the target state is treated as an idempotent
+no-op (still version-checked first, but leaves `version` and `updated_at` untouched if nothing
+would actually change) rather than a real state transition.
+
+### ADR-101 — List Pagination Envelope: `PageResponse[T]`
+
+Every list endpoint returns a generic `PageResponse[T]` envelope — `{items: T[], total: int,
+limit: int, offset: int}` — built with PEP 695 generic syntax (`class PageResponse[T](BaseModel)`
+in `app/schemas/common.py`), offset/limit-based with a default `limit=50`. This is the first use
+of this shape in the codebase (Phase 2 had no paginated list endpoint) and is the pattern every
+later phase's list endpoints are expected to reuse rather than inventing a per-resource shape.
+
+### ADR-102 — Duplicate-Warning API Mechanism (Customer-Only in Phase 3)
+
+A likely-duplicate `Customer` on create produces a `422` with a `WARNING`-severity issue
+(`POSSIBLE_DUPLICATE_CUSTOMER`, code `CUSTOMER_CREATE_WARNING` at the envelope level) rather than
+silently succeeding or hard-blocking; the client resubmits with `confirm_duplicate: true` to
+create unconditionally. Matching is case-insensitive exact comparison on `name` (trimmed,
+case-folded), OR exact match on a trimmed+case-folded `email`, OR exact match on a
+trimmed-only `phone` (deliberately no digit-stripping or country-code normalization, to avoid
+an incorrect equivalence assumption without a phone-parsing dependency) — no fuzzy/similarity
+matching. The check does not re-run on `PATCH`, so editing an unrelated field on an existing
+Customer never surprises the user with a duplicate warning triggered by their own unchanged
+name. Phase 3 implements this for `Customer` only — the phase-plan's own bullet list names
+"duplicate warning" solely under Customers. Spec §17.6's broader mention of Products/Ingredients
+is a general V1-wide capability statement, not a phase-scoping instruction; extending this
+mechanism to other resources remains deferred to whichever future phase explicitly scopes that
+work.
+
+### ADR-103 — Safe-Delete Pattern: Attempt-Delete With Driver-Specific FK-Violation Narrowing
+
+A resource's `DELETE` attempts the delete directly and translates a failure into a `409` only
+when the failure is specifically a foreign-key violation — narrowed to
+`isinstance(exc.orig, psycopg.errors.ForeignKeyViolation)`, not a blanket
+`except IntegrityError`, so an unrelated constraint failure is never misreported as "this record
+has references." This relies on the frozen schema's own `ondelete="NO ACTION"` FKs (Postgres
+itself refuses the delete and raises the violation) for every reference into `customers`/
+`products`/`selling_options` except one: `recipes.product_id`, the sole `CASCADE` edge, which the
+database would otherwise silently remove protected historical data through. `delete_product` is
+the only delete path with an explicit pre-check (`Recipe` existence, not "active recipe" —
+`Recipe` has no such concept), raising `409 PRODUCT_HAS_RECIPE` before the delete is even
+attempted; every other reference (order lines, purchased-product inventory and reservations,
+production requirements/runs, surplus inventory) is caught automatically by the attempt/catch
+path with zero per-table application code, and stays correctly protected as later phases
+populate those tables.

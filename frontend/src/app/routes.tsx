@@ -10,6 +10,12 @@ import { PasswordResetConfirmPage } from "../features/auth/PasswordResetConfirmP
 import { PasswordResetRequestPage } from "../features/auth/PasswordResetRequestPage";
 import { ProtectedRoute } from "../features/auth/ProtectedRoute";
 import { SignupPage } from "../features/auth/SignupPage";
+import { CustomerDetailPage } from "../features/customers/CustomerDetailPage";
+import { CustomerFormPage } from "../features/customers/CustomerFormPage";
+import { CustomerListPage } from "../features/customers/CustomerListPage";
+import { ProductDetailPage } from "../features/products/ProductDetailPage";
+import { ProductFormPage } from "../features/products/ProductFormPage";
+import { ProductListPage } from "../features/products/ProductListPage";
 
 // Phase 2 establishes the real authenticated app shell (Spec §12.2): every route under
 // /app is gated by ProtectedRoute, which derives auth state from the server-managed
@@ -36,6 +42,12 @@ function AppLayout() {
           <span className="font-semibold">{me?.business.name}</span>
           <Link to="/app/dashboard" className="text-muted-foreground hover:text-foreground">
             Dashboard
+          </Link>
+          <Link to="/app/customers" className="text-muted-foreground hover:text-foreground">
+            Customers
+          </Link>
+          <Link to="/app/products" className="text-muted-foreground hover:text-foreground">
+            Products
           </Link>
           <Link to="/app/account" className="text-muted-foreground hover:text-foreground">
             Account
@@ -91,6 +103,14 @@ export const routes: RouteObject[] = [
           { index: true, element: <Navigate to="/app/dashboard" replace /> },
           { path: "dashboard", element: <DashboardPage /> },
           { path: "account", element: <AccountSettingsPage /> },
+          { path: "customers", element: <CustomerListPage /> },
+          { path: "customers/new", element: <CustomerFormPage /> },
+          { path: "customers/:id", element: <CustomerDetailPage /> },
+          { path: "customers/:id/edit", element: <CustomerFormPage /> },
+          { path: "products", element: <ProductListPage /> },
+          { path: "products/new", element: <ProductFormPage /> },
+          { path: "products/:id", element: <ProductDetailPage /> },
+          { path: "products/:id/edit", element: <ProductFormPage /> },
         ],
       },
     ],

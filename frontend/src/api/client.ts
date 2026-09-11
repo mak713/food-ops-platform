@@ -91,5 +91,12 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
     throw new ApiError(body?.error.message ?? response.statusText, response.status, body);
   }
 
+  // Phase 3 plan v3 §7/§18: DELETE returns a true 204 with no body — the first
+  // empty-body response in the app (every Phase 2 response has a JSON body). Calling
+  // `.json()` on an empty body throws, so this must be checked before attempting it.
+  if (response.status === 204 || response.headers.get("content-length") === "0") {
+    return undefined as T;
+  }
+
   return response.json() as Promise<T>;
 }

@@ -118,3 +118,52 @@ describe("apiFetch option merge", () => {
     expect(headers.get("Content-Type")).toBe("application/x-www-form-urlencoded");
   });
 });
+
+// Phase 3 plan v3 §7/§18: DELETE returns a true 204 with no body — apiFetch must resolve
+// to `undefined` rather than throwing on `.json()` of an empty body, and must not regress
+// the existing 200-with-JSON-body path.
+describe("apiFetch empty-body (204) handling", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("resolves to undefined for a 204 response with no body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(null, { status: 204 })),
+    );
+
+    const result = await apiFetch("/api/v1/customers/some-id?version=1", { method: "DELETE" });
+
+    expect(result).toBeUndefined();
+  });
+
+  it("resolves to undefined for a 200 response with content-length: 0", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(null, { status: 200, headers: { "content-length": "0" } }),
+      ),
+    );
+
+    const result = await apiFetch("/api/v1/customers/some-id", { method: "DELETE" });
+
+    expect(result).toBeUndefined();
+  });
+
+  it("still parses a normal 200 JSON body correctly (non-regression)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ id: "abc", name: "Ada" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    const result = await apiFetch<{ id: string; name: string }>("/api/v1/customers/abc");
+
+    expect(result).toEqual({ id: "abc", name: "Ada" });
+  });
+});
