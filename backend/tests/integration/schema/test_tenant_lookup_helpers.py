@@ -14,12 +14,24 @@ import uuid
 
 import pytest
 
-from app.core.tenant import NotFoundError, get_owned_or_404, get_selling_option_for_product
+from app.core.tenant import (
+    NotFoundError,
+    get_owned_or_404,
+    get_recipe_for_product,
+    get_recipe_revision_for_recipe,
+    get_selling_option_for_product,
+    lock_recipe_for_product,
+)
 from app.db.models.customer import Customer
+from app.services.ingredient_service import lock_ingredients_for_business
+from app.services.product_service import get_product_for_business_locked
 from tests.integration.schema.factories import (
     make_business_graph,
     make_customer,
+    make_ingredient,
     make_product,
+    make_recipe,
+    make_recipe_revision,
     make_selling_option,
 )
 
@@ -89,3 +101,128 @@ def test_get_selling_option_for_product_owned_is_returned(session):
 
     result = get_selling_option_for_product(session, product, option.id)
     assert result.id == option.id
+
+
+# --- Phase 4: Product-lock, Recipe/RecipeRevision, Ingredient-lock helpers (Plan v4 §6) ---
+
+
+def test_get_product_for_business_locked_missing_raises_not_found(session):
+    business = make_business_graph(session)
+    session.flush()
+
+    with pytest.raises(NotFoundError):
+        get_product_for_business_locked(session, uuid.uuid4(), business)
+
+
+def test_get_product_for_business_locked_foreign_tenant_raises_not_found(session):
+    owner_business = make_business_graph(session)
+    other_business = make_business_graph(session)
+    foreign_product = make_product(session, other_business)
+    session.flush()
+
+    with pytest.raises(NotFoundError):
+        get_product_for_business_locked(session, foreign_product.id, owner_business)
+
+
+def test_get_product_for_business_locked_owned_is_returned(session):
+    business = make_business_graph(session)
+    product = make_product(session, business)
+    session.flush()
+
+    result = get_product_for_business_locked(session, product.id, business)
+    assert result.id == product.id
+
+
+def test_get_recipe_for_product_missing_raises_not_found(session):
+    business = make_business_graph(session)
+    product = make_product(session, business)
+    session.flush()
+
+    with pytest.raises(NotFoundError):
+        get_recipe_for_product(session, product)
+
+
+def test_get_recipe_for_product_owned_is_returned(session):
+    business = make_business_graph(session)
+    product = make_product(session, business)
+    recipe = make_recipe(session, business, product)
+    session.flush()
+
+    result = get_recipe_for_product(session, product)
+    assert result.id == recipe.id
+
+
+def test_lock_recipe_for_product_owned_is_returned(session):
+    business = make_business_graph(session)
+    product = make_product(session, business)
+    recipe = make_recipe(session, business, product)
+    session.flush()
+
+    result = lock_recipe_for_product(session, product)
+    assert result.id == recipe.id
+
+
+def test_lock_recipe_for_product_missing_raises_not_found(session):
+    business = make_business_graph(session)
+    product = make_product(session, business)
+    session.flush()
+
+    with pytest.raises(NotFoundError):
+        lock_recipe_for_product(session, product)
+
+
+def test_get_recipe_revision_for_recipe_missing_raises_not_found(session):
+    business = make_business_graph(session)
+    product = make_product(session, business)
+    recipe = make_recipe(session, business, product)
+    session.flush()
+
+    with pytest.raises(NotFoundError):
+        get_recipe_revision_for_recipe(session, recipe, uuid.uuid4())
+
+
+def test_get_recipe_revision_for_recipe_belonging_to_different_recipe_raises_not_found(session):
+    business = make_business_graph(session)
+    product_a = make_product(session, business, name="Product A")
+    product_b = make_product(session, business, name="Product B")
+    recipe_a = make_recipe(session, business, product_a, name="Recipe A")
+    recipe_b = make_recipe(session, business, product_b, name="Recipe B")
+    revision_of_b = make_recipe_revision(session, business, recipe_b)
+    session.flush()
+
+    # Same tenant, wrong recipe — must still 404, proving the recipe_id predicate (not
+    # just business_id) is doing real work.
+    with pytest.raises(NotFoundError):
+        get_recipe_revision_for_recipe(session, recipe_a, revision_of_b.id)
+
+
+def test_get_recipe_revision_for_recipe_owned_is_returned(session):
+    business = make_business_graph(session)
+    product = make_product(session, business)
+    recipe = make_recipe(session, business, product)
+    revision = make_recipe_revision(session, business, recipe)
+    session.flush()
+
+    result = get_recipe_revision_for_recipe(session, recipe, revision.id)
+    assert result.id == revision.id
+
+
+def test_lock_ingredients_for_business_resolves_only_owned_ids(session):
+    owner_business = make_business_graph(session)
+    other_business = make_business_graph(session)
+    owned = make_ingredient(session, owner_business, name="Owned")
+    foreign = make_ingredient(session, other_business, name="Foreign")
+    session.flush()
+
+    result = lock_ingredients_for_business(
+        session, [owned.id, foreign.id, uuid.uuid4()], owner_business
+    )
+    assert set(result.keys()) == {owned.id}
+    assert result[owned.id].id == owned.id
+
+
+def test_lock_ingredients_for_business_empty_input_returns_empty_dict(session):
+    business = make_business_graph(session)
+    session.flush()
+
+    assert lock_ingredients_for_business(session, [], business) == {}

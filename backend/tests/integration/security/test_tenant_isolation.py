@@ -342,6 +342,235 @@ def test_foreign_tenant_cannot_mutate_product(client):
     assert still_owned.json()["is_active"] is True
 
 
+def test_foreign_tenant_ingredient_returns_non_revealing_404(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    created = client.post(
+        "/api/v1/ingredients",
+        json={"name": "Business A Flour", "measurement_family": "WEIGHT", "canonical_unit": "g"},
+        headers=csrf_headers(client),
+    ).json()
+
+    _use_session(client, tenants["b"])
+    foreign = client.get(f"/api/v1/ingredients/{created['id']}")
+    missing = client.get("/api/v1/ingredients/00000000-0000-0000-0000-000000000000")
+
+    assert foreign.status_code == missing.status_code == 404
+    foreign_error = {k: v for k, v in foreign.json()["error"].items() if k != "request_id"}
+    missing_error = {k: v for k, v in missing.json()["error"].items() if k != "request_id"}
+    assert foreign_error == missing_error
+    assert foreign_error["code"] == "NOT_FOUND"
+
+
+def test_foreign_tenant_cannot_mutate_ingredient(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    created = client.post(
+        "/api/v1/ingredients",
+        json={"name": "Business A Flour", "measurement_family": "WEIGHT", "canonical_unit": "g"},
+        headers=csrf_headers(client),
+    ).json()
+
+    _use_session(client, tenants["b"])
+    headers_b = csrf_headers(client)
+
+    patch_response = client.patch(
+        f"/api/v1/ingredients/{created['id']}",
+        json={"version": created["version"], "name": "Hijacked"},
+        headers=headers_b,
+    )
+    archive_response = client.post(
+        f"/api/v1/ingredients/{created['id']}/archive",
+        json={"version": created["version"]},
+        headers=headers_b,
+    )
+    delete_response = client.delete(
+        f"/api/v1/ingredients/{created['id']}?version={created['version']}", headers=headers_b
+    )
+    assert patch_response.status_code == 404
+    assert archive_response.status_code == 404
+    assert delete_response.status_code == 404
+
+    _use_session(client, tenants["a"])
+    still_owned = client.get(f"/api/v1/ingredients/{created['id']}")
+    assert still_owned.status_code == 200
+    assert still_owned.json()["name"] == "Business A Flour"
+
+
+def test_ingredient_list_never_leaks_foreign_tenant_rows(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    client.post(
+        "/api/v1/ingredients",
+        json={"name": "Business A Only", "measurement_family": "WEIGHT", "canonical_unit": "g"},
+        headers=csrf_headers(client),
+    )
+
+    _use_session(client, tenants["b"])
+    listing = client.get("/api/v1/ingredients")
+    assert listing.status_code == 200
+    assert listing.json()["total"] == 0
+    assert listing.json()["items"] == []
+
+
+def test_foreign_tenant_recipe_returns_non_revealing_404(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    product = client.post(
+        "/api/v1/products",
+        json={"name": "Business A Product", "product_type": "PRODUCED"},
+        headers=csrf_headers(client),
+    ).json()
+    ingredient = client.post(
+        "/api/v1/ingredients",
+        json={"name": "Flour", "measurement_family": "WEIGHT", "canonical_unit": "g"},
+        headers=csrf_headers(client),
+    ).json()
+    client.post(
+        f"/api/v1/products/{product['id']}/recipe",
+        json={
+            "name": "Recipe",
+            "yield_quantity": "12",
+            "active_time_minutes": 10,
+            "ingredients": [{"ingredient_id": ingredient["id"], "quantity": "1", "unit": "g"}],
+        },
+        headers=csrf_headers(client),
+    )
+
+    _use_session(client, tenants["b"])
+    foreign = client.get(f"/api/v1/products/{product['id']}/recipe")
+    missing = client.get("/api/v1/products/00000000-0000-0000-0000-000000000000/recipe")
+    assert foreign.status_code == missing.status_code == 404
+
+
+def test_foreign_tenant_cannot_create_or_rename_recipe(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    product = client.post(
+        "/api/v1/products",
+        json={"name": "Business A Product", "product_type": "PRODUCED"},
+        headers=csrf_headers(client),
+    ).json()
+
+    _use_session(client, tenants["b"])
+    headers_b = csrf_headers(client)
+    ingredient_b = client.post(
+        "/api/v1/ingredients",
+        json={"name": "Flour", "measurement_family": "WEIGHT", "canonical_unit": "g"},
+        headers=headers_b,
+    ).json()
+
+    create_response = client.post(
+        f"/api/v1/products/{product['id']}/recipe",
+        json={
+            "name": "Hijacked Recipe",
+            "yield_quantity": "12",
+            "active_time_minutes": 10,
+            "ingredients": [{"ingredient_id": ingredient_b["id"], "quantity": "1", "unit": "g"}],
+        },
+        headers=headers_b,
+    )
+    assert create_response.status_code == 404
+
+    rename_response = client.patch(
+        f"/api/v1/products/{product['id']}/recipe",
+        json={"name": "Hijacked"},
+        headers=headers_b,
+    )
+    assert rename_response.status_code == 404
+
+    _use_session(client, tenants["a"])
+    still_no_recipe = client.get(f"/api/v1/products/{product['id']}/recipe")
+    assert still_no_recipe.status_code == 404  # Business A never created one either
+
+
+def test_recipe_revision_detail_via_foreign_tenant_product_returns_non_revealing_404(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    product = client.post(
+        "/api/v1/products",
+        json={"name": "Business A Product", "product_type": "PRODUCED"},
+        headers=csrf_headers(client),
+    ).json()
+    ingredient = client.post(
+        "/api/v1/ingredients",
+        json={"name": "Flour", "measurement_family": "WEIGHT", "canonical_unit": "g"},
+        headers=csrf_headers(client),
+    ).json()
+    recipe = client.post(
+        f"/api/v1/products/{product['id']}/recipe",
+        json={
+            "name": "Recipe",
+            "yield_quantity": "12",
+            "active_time_minutes": 10,
+            "ingredients": [{"ingredient_id": ingredient["id"], "quantity": "1", "unit": "g"}],
+        },
+        headers=csrf_headers(client),
+    ).json()
+    revision_id = recipe["current_revision"]["id"]
+
+    _use_session(client, tenants["b"])
+    detail = client.get(f"/api/v1/products/{product['id']}/recipe/revisions/{revision_id}")
+    listing = client.get(f"/api/v1/products/{product['id']}/recipe/revisions")
+    assert detail.status_code == 404
+    assert listing.status_code == 404
+
+
+def test_create_recipe_rejects_foreign_tenant_ingredient_id_identically_to_missing(client):
+    """Body-embedded relationship reference (Phase 4 Plan v4 §9) — a real ingredient
+    belonging to another tenant must produce the exact same structured 422 issue as a
+    nonexistent ingredient_id, never revealing that it actually exists elsewhere."""
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    foreign_ingredient = client.post(
+        "/api/v1/ingredients",
+        json={"name": "Business A Flour", "measurement_family": "WEIGHT", "canonical_unit": "g"},
+        headers=csrf_headers(client),
+    ).json()
+
+    _use_session(client, tenants["b"])
+    headers_b = csrf_headers(client)
+    product_b = client.post(
+        "/api/v1/products",
+        json={"name": "Business B Product", "product_type": "PRODUCED"},
+        headers=headers_b,
+    ).json()
+
+    missing = client.post(
+        f"/api/v1/products/{product_b['id']}/recipe",
+        json={
+            "name": "Recipe",
+            "yield_quantity": "12",
+            "active_time_minutes": 10,
+            "ingredients": [
+                {
+                    "ingredient_id": "00000000-0000-0000-0000-000000000000",
+                    "quantity": "1",
+                    "unit": "g",
+                }
+            ],
+        },
+        headers=headers_b,
+    )
+    foreign = client.post(
+        f"/api/v1/products/{product_b['id']}/recipe",
+        json={
+            "name": "Recipe",
+            "yield_quantity": "12",
+            "active_time_minutes": 10,
+            "ingredients": [
+                {"ingredient_id": foreign_ingredient["id"], "quantity": "1", "unit": "g"}
+            ],
+        },
+        headers=headers_b,
+    )
+    assert missing.status_code == foreign.status_code == 422
+    missing_issue = missing.json()["error"]["issues"][0]
+    foreign_issue = foreign.json()["error"]["issues"][0]
+    assert missing_issue["code"] == foreign_issue["code"] == "INGREDIENT_NOT_FOUND"
+    assert missing_issue["message"] == foreign_issue["message"]
+
+
 def test_product_list_never_leaks_foreign_tenant_rows(client):
     tenants = _signup_two_businesses(client)
     _use_session(client, tenants["a"])

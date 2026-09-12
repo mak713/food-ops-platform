@@ -2,7 +2,7 @@
 // managed, for both a freshly-created (possibly empty) Product and an existing one alike.
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { ApiError } from "../../api/client";
 import { ErrorBanner } from "../../components/shared/ErrorBanner";
 import {
@@ -21,12 +21,15 @@ import { Button, buttonVariants } from "../../components/ui/button";
 import {
   Table,
   TableBody,
+  TableCell,
   TableHead,
   TableHeader,
   TableRow,
 } from "../../components/ui/table";
+import { formatDecimal } from "../../lib/decimal";
 import { productsApi } from "./api";
 import { NewSellingOptionForm } from "./NewSellingOptionForm";
+import { recipeApi } from "./recipeApi";
 import { SellingOptionRow } from "./SellingOptionRow";
 
 export function ProductDetailPage() {
@@ -64,6 +67,13 @@ export function ProductDetailPage() {
     },
   });
 
+  const recipeQuery = useQuery({
+    queryKey: ["products", id, "recipe"],
+    queryFn: () => recipeApi.get(id as string),
+    enabled: query.data?.product_type === "PRODUCED",
+    retry: false,
+  });
+
   if (query.isLoading) {
     return <p className="text-sm text-muted-foreground">Loading…</p>;
   }
@@ -87,6 +97,7 @@ export function ProductDetailPage() {
   if (!product) {
     return null;
   }
+
   const actionError = archiveMutation.error ?? reactivateMutation.error ?? deleteMutation.error;
   const isStale = (err: unknown) =>
     err instanceof ApiError && err.body?.error.code === "STALE_VERSION";
@@ -245,6 +256,106 @@ export function ProductDetailPage() {
 
         <NewSellingOptionForm productId={product.id} />
       </div>
+
+      {product.product_type === "PRODUCED" && (
+        <div className="flex flex-col gap-3">
+          <h2 className="text-lg font-semibold">Recipe</h2>
+
+          {recipeQuery.isLoading ? (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : recipeQuery.isError ? (
+            recipeQuery.error instanceof ApiError && recipeQuery.error.status === 404 ? (
+              <div className="flex items-center gap-3">
+                <p className="text-sm text-muted-foreground">No recipe yet.</p>
+                <Link
+                  to={`/app/products/${product.id}/recipe/new`}
+                  className="text-sm underline-offset-4 hover:underline"
+                >
+                  Create Recipe
+                </Link>
+              </div>
+            ) : (
+              <ErrorBanner error={recipeQuery.error} onRetry={() => recipeQuery.refetch()} />
+            )
+          ) : recipeQuery.data ? (
+            <>
+              <p className="text-sm font-medium">{recipeQuery.data.name}</p>
+              <dl className="flex flex-col gap-2 text-sm">
+                <div>
+                  <dt className="text-muted-foreground">Current revision</dt>
+                  <dd>#{recipeQuery.data.current_revision.revision_number}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Yield</dt>
+                  <dd>{formatDecimal(recipeQuery.data.current_revision.yield_quantity)}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Active time</dt>
+                  <dd>{recipeQuery.data.current_revision.active_time_minutes} minutes</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Elapsed time</dt>
+                  <dd>
+                    {recipeQuery.data.current_revision.elapsed_time_minutes != null
+                      ? `${recipeQuery.data.current_revision.elapsed_time_minutes} minutes`
+                      : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Notes</dt>
+                  <dd className="whitespace-pre-wrap">
+                    {recipeQuery.data.current_revision.notes ?? "—"}
+                  </dd>
+                </div>
+              </dl>
+
+              <div className="flex flex-col gap-2">
+                <span className="text-sm font-medium">Ingredients</span>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Ingredient</TableHead>
+                      <TableHead>Quantity</TableHead>
+                      <TableHead>Unit</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {recipeQuery.data.current_revision.ingredients.map((line) => (
+                      <TableRow key={line.id}>
+                        <TableCell>
+                          {line.ingredient_name}
+                          {!line.ingredient_is_active && (
+                            <Badge variant="secondary" className="ml-2">
+                              Archived
+                            </Badge>
+                          )}
+                        </TableCell>
+                        <TableCell>{formatDecimal(line.quantity)}</TableCell>
+                        <TableCell>{line.unit}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3">
+                <Link
+                  to={`/app/products/${product.id}/recipe/edit`}
+                  className="text-sm underline-offset-4 hover:underline"
+                >
+                  Edit Recipe
+                </Link>
+                <Link
+                  to={`/app/products/${product.id}/recipe/history`}
+                  className="text-sm underline-offset-4 hover:underline"
+                >
+                  View History
+                </Link>
+              </div>
+            </>
+          ) : null}
+        </div>
+      )}
     </div>
   );
 }

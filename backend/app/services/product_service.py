@@ -18,6 +18,7 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from app.core.api_errors import ApiError
 from app.core.tenant import (
+    NotFoundError,
     check_version,
     commit_or_raise_stale,
     get_owned_or_404,
@@ -39,6 +40,29 @@ from app.schemas.product import (
 
 def get_product_for_business(db: Session, product_id: uuid.UUID, business: Business) -> Product:
     return get_owned_or_404(db, Product, product_id, business)
+
+
+def get_product_for_business_locked(
+    db: Session, product_id: uuid.UUID, business: Business
+) -> Product:
+    """Tenant-scoped `SELECT ... FOR UPDATE` on the Product row (Phase 4 Plan v4 §6c) —
+    an approved cross-phase concurrency hardening, not a Phase 3 feature change. Closes a
+    race Phase 4 introduces: without this lock, `delete_product` could pre-check "no
+    Recipe exists," a concurrent request could then create that Product's first Recipe,
+    and the original deletion could still proceed, `CASCADE`-deleting the just-created
+    Recipe. Both `delete_product` (below) and Phase 4's `create_recipe` acquire this same
+    lock, in the same relative position (first, before anything that reads/depends on the
+    Product's Recipe state), so the two workflows always serialize on this row instead of
+    racing. Scoped by `(id, business_id)` in the query itself, matching ADR-099 exactly —
+    never a bare `WHERE Product.id = ...`."""
+    obj = db.scalar(
+        select(Product)
+        .where(Product.id == product_id, Product.business_id == business.id)
+        .with_for_update()
+    )
+    if obj is None:
+        raise NotFoundError()
+    return obj
 
 
 def create_product(db: Session, business: Business, payload: ProductCreateRequest) -> Product:
@@ -143,11 +167,29 @@ def delete_product(
     catching the resulting foreign-key violation covers all of them without a
     hand-maintained per-table list. The DB's own `CASCADE` on `selling_options.product_id`
     then safely removes any (necessarily unreferenced, by the same NO ACTION guarantee)
-    Selling Options atomically within the same statement."""
-    product = get_product_for_business(db, product_id, business)
-    check_version(product, expected_version, resource="product")
+    Selling Options atomically within the same statement.
+
+    Phase 4 Plan v4 §6c (approved cross-phase concurrency hardening): the Product row is
+    locked first, before the version check and the Recipe-existence check below, so a
+    concurrent first-Recipe creation (Phase 4) cannot slip a new Recipe in between this
+    function's existence check and its actual delete — see
+    `get_product_for_business_locked`'s own docstring for the full race this closes.
+    Every external behavior below (stale version, PRODUCT_HAS_RECIPE, PRODUCT_HAS_REFERENCES,
+    success) is unchanged from Phase 3 — only the upfront lock is new.
+
+    Both expected-rejection paths below (stale version, existing Recipe) now explicitly
+    roll back before raising — the Product row lock must not be held past an expected
+    rejection while its transaction sits open. Only the expected `ApiError` is caught for
+    the version check; an unexpected exception is never swallowed."""
+    product = get_product_for_business_locked(db, product_id, business)
+    try:
+        check_version(product, expected_version, resource="product")
+    except ApiError:
+        db.rollback()
+        raise
 
     if db.scalar(select(Recipe.id).where(Recipe.product_id == product.id).limit(1)) is not None:
+        db.rollback()
         raise ApiError(
             409,
             "PRODUCT_HAS_RECIPE",

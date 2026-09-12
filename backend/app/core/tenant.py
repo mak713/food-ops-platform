@@ -20,6 +20,7 @@ from sqlalchemy.orm.exc import StaleDataError
 from app.core.api_errors import ApiError
 from app.db.models.business import Business
 from app.db.models.product import Product, SellingOption
+from app.db.models.recipe import Recipe, RecipeRevision
 
 _NOT_FOUND_MESSAGE = "The requested resource was not found."
 _STALE_VERSION_MESSAGE = (
@@ -61,6 +62,57 @@ def get_selling_option_for_product(
             SellingOption.id == option_id,
             SellingOption.product_id == product.id,
             SellingOption.business_id == product.business_id,
+        )
+    )
+    if obj is None:
+        raise NotFoundError()
+    return obj
+
+
+def get_recipe_for_product(db: Session, product: Product) -> Recipe:
+    """`product` must already be the caller's own tenant-scoped Product. A Recipe belongs
+    to exactly one Product (`uq_recipes_business_id_product_id`, Phase 4 Plan v4 §2), so
+    it is looked up by `(product_id, business_id)` rather than its own `id` — scoped in
+    the query itself (ADR-099), never a bare unscoped fetch."""
+    obj = db.scalar(
+        select(Recipe).where(
+            Recipe.product_id == product.id, Recipe.business_id == product.business_id
+        )
+    )
+    if obj is None:
+        raise NotFoundError()
+    return obj
+
+
+def lock_recipe_for_product(db: Session, product: Product) -> Recipe:
+    """Tenant/parent-scoped `SELECT ... FOR UPDATE` on the Recipe row (Phase 4 Plan v4
+    §6a) — used before creating a replacement revision, so every concurrent revision-
+    creation attempt for the same Recipe serializes against the others. Scoped by
+    `(product_id, business_id)` in the query itself, exactly like `get_recipe_for_product`
+    above — never a bare `WHERE Recipe.id = ...` leaning on an already-verified object."""
+    obj = db.scalar(
+        select(Recipe)
+        .where(Recipe.product_id == product.id, Recipe.business_id == product.business_id)
+        .with_for_update()
+    )
+    if obj is None:
+        raise NotFoundError()
+    return obj
+
+
+def get_recipe_revision_for_recipe(
+    db: Session, recipe: Recipe, revision_id: uuid.UUID
+) -> RecipeRevision:
+    """`recipe` must already be the caller's own tenant-scoped Recipe. Scopes the SELECT
+    by `(id, recipe_id, business_id)` together — the same three-predicate pattern as
+    `get_selling_option_for_product` above — so a revision belonging to a *different*
+    recipe (even under the same tenant) or a different tenant entirely is equally
+    unreachable in one query (Phase 4 Plan v4 §6a)."""
+    obj = db.scalar(
+        select(RecipeRevision).where(
+            RecipeRevision.id == revision_id,
+            RecipeRevision.recipe_id == recipe.id,
+            RecipeRevision.business_id == recipe.business_id,
         )
     )
     if obj is None:

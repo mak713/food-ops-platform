@@ -31,12 +31,19 @@ import threading
 from app.core.api_errors import ApiError
 from app.db.models.business import Business
 from app.db.models.customer import Customer
+from app.db.models.ingredient import Ingredient
 from app.db.models.product import Product
 from app.db.models.user import User
 from app.schemas.customer import CustomerUpdateRequest
+from app.schemas.ingredient import IngredientUpdateRequest
 from app.schemas.product import ProductUpdateRequest
-from app.services import customer_service, product_service
-from tests.integration.schema.factories import make_business_graph, make_customer, make_product
+from app.services import customer_service, ingredient_service, product_service
+from tests.integration.schema.factories import (
+    make_business_graph,
+    make_customer,
+    make_ingredient,
+    make_product,
+)
 
 
 def _run_service_version_race(real_session_factory, run_update, row_id, business_id):
@@ -193,6 +200,60 @@ def test_service_layer_concurrent_product_update_translates_to_stale_version_api
             real_session_factory,
             row_model=Product,
             row_id=product_id,
+            business_id=business_id,
+            owner_id=owner_id,
+        )
+
+
+def test_service_layer_concurrent_ingredient_update_translates_to_stale_version_api_error(
+    real_session_factory,
+):
+    """Phase 4 Plan v4 §4: Ingredient now carries the same `version_id_col` wiring as
+    Product/SellingOption — this proves the real within-transaction race is caught and
+    translated identically, not just that the application-level `check_version` pre-check
+    works (already covered at the HTTP level in test_ingredients.py)."""
+    setup_db = real_session_factory()
+    try:
+        business = make_business_graph(setup_db)
+        ingredient = make_ingredient(setup_db, business, name="Race Flour")
+        setup_db.commit()
+        ingredient_id = ingredient.id
+        business_id = business.id
+        owner_id = business.owner_user_id
+    finally:
+        setup_db.close()
+
+    def run_update(db, business, row_id) -> None:
+        payload = IngredientUpdateRequest(version=1, name="Updated")
+        ingredient_service.update_ingredient(db, business, row_id, payload)
+
+    try:
+        results = _run_service_version_race(
+            real_session_factory, run_update, ingredient_id, business_id
+        )
+        oks = [r for kind, r in results if kind == "ok"]
+        api_errors = [r for kind, r in results if kind == "api_error"]
+        assert len(oks) == 1, f"expected exactly one winner, got {results}"
+        assert len(api_errors) == 1, f"expected exactly one ApiError, got {results}"
+
+        stale_error = api_errors[0]
+        assert isinstance(stale_error, ApiError)
+        assert stale_error.status_code == 409
+        assert stale_error.code == "STALE_VERSION"
+        assert "changed since you opened it" in stale_error.message
+
+        verify_db = real_session_factory()
+        try:
+            final = verify_db.get(Ingredient, ingredient_id)
+            assert final.version == 2, "winner's UPDATE should have incremented version by 1"
+            assert final.name == "Updated"
+        finally:
+            verify_db.close()
+    finally:
+        _cleanup_business_graph(
+            real_session_factory,
+            row_model=Ingredient,
+            row_id=ingredient_id,
             business_id=business_id,
             owner_id=owner_id,
         )

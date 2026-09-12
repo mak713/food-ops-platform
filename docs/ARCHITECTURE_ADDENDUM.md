@@ -306,3 +306,136 @@ attempted; every other reference (order lines, purchased-product inventory and r
 production requirements/runs, surplus inventory) is caught automatically by the attempt/catch
 path with zero per-table application code, and stays correctly protected as later phases
 populate those tables.
+
+### ADR-104 — Ingredient Joins the Optimistic-Concurrency `version_id_col` Cohort
+
+`Ingredient` now declares the identical `__mapper_args__ = {"version_id_col": cls.version}`
+`@declared_attr.directive` wiring ADR-100 established for `Customer`/`Product`/`SellingOption` —
+Spec §8.33 already named `Ingredient` in its optimistic-concurrency list; Phase 3 simply hadn't
+reached it yet. Every mutating Ingredient operation (`PATCH`, archive, reactivate, delete) performs
+the identical client-submitted-`version` pre-check via `check_version` before writing anything.
+From there, the two write shapes translate the rarer within-transaction race the same way but
+through different code paths: `PATCH`/archive/reactivate route their commit through the shared
+`commit_or_raise_stale` helper, while hard-delete performs its own direct `db.delete(...)` +
+`db.commit()` and explicitly catches the ORM's `StaleDataError` itself (since a delete has no
+"changed columns" to route through the update-oriented helper). Both forms translate that race
+into the identical `409 STALE_VERSION` envelope — no variant *contract* was introduced for it, even
+though the delete path's commit is not literally a call to `commit_or_raise_stale`. `Recipe` and
+`RecipeRevision` deliberately do not follow this pattern at all; see ADR-105.
+
+### ADR-105 — Concurrency for Version-less, Append-Only Aggregates: Row Lock Plus Expected-Parent-State-ID Equality Check
+
+`Recipe` and `RecipeRevision` carry no `version` column — Spec §8.33 does not name them, and
+`RecipeRevision` content is immutable by design (§8.9/§15.10), so a version column on it would be
+meaningless. Editing a Recipe means creating a new immutable `RecipeRevision` and switching which
+one is current, never mutating existing content in place — an append-only-revision shape
+ADR-100's `version_id_col` mechanism doesn't fit.
+
+The established concurrency idiom for this shape instead is a real PostgreSQL row lock
+(`SELECT ... FOR UPDATE`), applied differently depending on whether a current revision already
+exists:
+
+- **Replacement revision** (a Recipe already exists): lock the `Recipe` row itself
+  (`app/core/tenant.py::lock_recipe_for_product`), load exactly one current revision under that
+  lock, and compare its id against the client-supplied `expected_current_revision_id` — captured
+  by the client when its edit session began, never silently re-derived. A mismatch is
+  `409 RECIPE_REVISION_CONFLICT` with no write: the same "reject a stale write, never silently
+  overwrite" principle Spec §17.8 states for version-column resources, enforced here through a
+  lock-and-compare rather than a version column. Only once that comparison passes does the
+  replacement (flip old `is_current`, insert the new revision) proceed under the same lock.
+- **First-Recipe creation** (no Recipe, and therefore no current revision, exists yet): there is
+  nothing to compare an `expected_current_revision_id` against, so none is sent or checked. Instead
+  the `Product` row itself is locked first (ADR-106), and Recipe-nonexistence is checked under that
+  lock — serializing first-Recipe creation against both a concurrent Product deletion and a
+  concurrent competing first-Recipe creation for the same Product.
+
+Both shapes share the same durable principle — contested/stale parent state is checked under a
+real row lock before any write, never silently overwritten — but only the replacement-revision
+shape has an existing revision to compare against; first-Recipe creation has no analogous
+"expected" value to check at all. Any future version-less, append-only-revision-style aggregate
+should follow whichever of these two shapes actually fits (an existing-state comparison under a
+lock when prior state exists, or a plain existence-check under a lock when it doesn't) rather than
+inventing a version column that would misrepresent immutable content as though it had
+independently-mutable state of its own.
+
+A detected violation of the "exactly one current revision" invariant (zero or more than one
+current row found under the lock) is never silently repaired or arbitrarily picked — it raises an
+unhandled `RuntimeError`, rolling back and surfacing through the application's existing
+generic-500 path. This is the standing convention for any future phase that detects a broken data
+invariant at read time: crash loudly through the existing error path, never self-heal a corrupted
+invariant transparently.
+
+### ADR-106 — Lock Ordering Discipline: Deterministic Multi-Row Order and Shared-Ancestor Locking Across Racing Workflows
+
+Two related lock-ordering conventions were established, both aimed at bounding deadlock risk
+without claiming to eliminate it entirely:
+
+1. **Deterministic multi-row locking.** Whenever one operation must lock more than one row of the
+   same table — `ingredient_service.lock_ingredients_for_business` locking every Ingredient a
+   Recipe/Revision references — the rows are locked in a fixed, deterministic order (sorted by
+   `id`) rather than in submission order. Any two concurrent operations locking overlapping rows
+   of that table therefore always request their locks in the same relative order, so the classic
+   circular-wait deadlock precondition cannot arise between them. This is the standard pattern for
+   any future phase that must lock multiple sibling rows together (e.g. multiple Order lines,
+   multiple inventory rows).
+2. **Shared-ancestor locking for cross-workflow races.** Two independently-evolving workflows that
+   can race on a common parent resource — first-Recipe creation and Product deletion, both of
+   which depend on whether a Product currently has a Recipe — both lock that same shared ancestor
+   row (`product_service.get_product_for_business_locked`), in the same relative position within
+   each workflow (first, before anything that reads/depends on the contested state), so the two
+   workflows always serialize on it instead of racing past each other. This is the durable
+   convention for any future pair of independently-evolving workflows that can race on a shared
+   parent (e.g. a future Order-cancellation vs. Production-start race).
+
+Across both first-Recipe creation and replacement-revision creation, the fixed order is always
+parent-row-first, then Ingredient rows in sorted order — never reversed.
+
+### ADR-107 — Non-Disclosing Validation for a Body-Embedded Relationship Reference
+
+ADR-099 covers a URL-path resource lookup: a foreign-tenant or nonexistent resource id in the URL
+produces the shared `NotFoundError` → `404`. A different shape of reference — a resource id
+embedded inside a request body, referencing a sibling resource rather than identifying the
+resource the URL itself addresses (a Recipe/Revision request's `ingredients[].ingredient_id`) —
+instead produces a structured `422` with a per-line issue (code `INGREDIENT_NOT_FOUND`, `field`
+pointing at the specific array index), deliberately identical in shape whether the id doesn't
+exist at all or belongs to another tenant. This is a distinct, second non-disclosure pattern
+future phases should reach for whenever a request body references a sibling resource by id (as
+opposed to the URL identifying the resource itself): a body-embedded foreign/missing reference is
+a validation-shaped `422` issue, not a `404`, but the foreign-vs-missing indistinguishability
+requirement (Spec §10.5) still applies identically.
+
+### ADR-108 — Archived-Master-Data Carry-Forward Rule
+
+An archived (no longer active) master-data record — first established for `Ingredient` — may not
+be newly introduced into a fresh reference, but a reference already present before it was archived
+remains valid and is preserved rather than force-removed or force-rejected. Concretely, for a
+replacement Recipe Revision: a line's Ingredient *identity* may be carried forward from the base
+revision only when that same Ingredient was already present on that immediately preceding
+revision — it can never be newly (re-)introduced once archived, even if it was referenced on some
+earlier revision further back. Once carried forward, that line's Ingredient identity stays fixed
+to the archived Ingredient, but the line is not otherwise frozen: its quantity and unit remain
+editable in the new revision like any other line (subject to the usual unit-family compatibility
+check against that Ingredient), and the line may be removed from the new revision entirely if it's
+no longer wanted. If it is removed, that same archived Ingredient cannot later be newly re-added to
+a still-later revision while it remains archived — removal is not a temporary edit that can be
+undone by re-adding the identity once archived, only by the Ingredient being reactivated first. None
+of this touches the base revision itself: as always, it is immutable history and is never rewritten
+by a later edit or by an unrelated archive action. This is a general master-data rule, not an
+Ingredient-specific one — any future phase introducing another archivable master-data resource
+referenced by an otherwise-immutable historical record (e.g. a future archived Customer discount
+tier still validly referenced by a past Order) should default to this same "active-only for a new
+reference, carried-forward-only for an already-present one, and not restorable by re-adding once
+removed" shape rather than reinventing the decision per resource.
+
+### ADR-109 — `app/domain/` as the Home for Deterministic Pure Calculators, With Mandatory Self-Contained Decimal-Context Isolation
+
+Spec §11.3 calls for deterministic, side-effect-free business calculators (`RecipeScaling`,
+`UnitConversion`, and others named for later phases). Phase 4 establishes `app/domain/` as the
+package these live in (`app/domain/unit_conversion.py`, `app/domain/recipe_scaling.py`) and
+demonstrates the concrete implementation bar the pattern requires: no HTTP or database access,
+and — since these are Decimal-heavy calculations — every public function runs its arithmetic
+inside its own explicit `decimal.localcontext()` with a fixed precision, so a result can never
+depend on, or leak into, whatever ambient `decimal.getcontext()` precision the caller happens to
+have set. Later phases' own domain calculators (demand aggregation, surplus allocation, planned
+costing, etc.) are expected to live under this same package and meet this same
+self-contained-context bar, not just the "pure function, no I/O" half of it.

@@ -13,9 +13,16 @@ import { SignupPage } from "../features/auth/SignupPage";
 import { CustomerDetailPage } from "../features/customers/CustomerDetailPage";
 import { CustomerFormPage } from "../features/customers/CustomerFormPage";
 import { CustomerListPage } from "../features/customers/CustomerListPage";
+import { IngredientDetailPage } from "../features/ingredients/IngredientDetailPage";
+import { IngredientFormPage } from "../features/ingredients/IngredientFormPage";
+import { IngredientListPage } from "../features/ingredients/IngredientListPage";
 import { ProductDetailPage } from "../features/products/ProductDetailPage";
 import { ProductFormPage } from "../features/products/ProductFormPage";
 import { ProductListPage } from "../features/products/ProductListPage";
+import { RecipeCreatePage } from "../features/products/RecipeCreatePage";
+import { RecipeEditPage } from "../features/products/RecipeEditPage";
+import { RecipeHistoryPage } from "../features/products/RecipeHistoryPage";
+import { RecipeRevisionDetailPage } from "../features/products/RecipeRevisionDetailPage";
 
 // Phase 2 establishes the real authenticated app shell (Spec §12.2): every route under
 // /app is gated by ProtectedRoute, which derives auth state from the server-managed
@@ -48,6 +55,9 @@ function AppLayout() {
           </Link>
           <Link to="/app/products" className="text-muted-foreground hover:text-foreground">
             Products
+          </Link>
+          <Link to="/app/inventory/ingredients" className="text-muted-foreground hover:text-foreground">
+            Inventory
           </Link>
           <Link to="/app/account" className="text-muted-foreground hover:text-foreground">
             Account
@@ -111,6 +121,17 @@ export const routes: RouteObject[] = [
           { path: "products/new", element: <ProductFormPage /> },
           { path: "products/:id", element: <ProductDetailPage /> },
           { path: "products/:id/edit", element: <ProductFormPage /> },
+          { path: "products/:id/recipe/new", element: <RecipeCreatePage /> },
+          { path: "products/:id/recipe/edit", element: <RecipeEditPage /> },
+          { path: "products/:id/recipe/history", element: <RecipeHistoryPage /> },
+          {
+            path: "products/:id/recipe/revisions/:revisionId",
+            element: <RecipeRevisionDetailPage />,
+          },
+          { path: "inventory/ingredients", element: <IngredientListPage /> },
+          { path: "inventory/ingredients/new", element: <IngredientFormPage /> },
+          { path: "inventory/ingredients/:id", element: <IngredientDetailPage /> },
+          { path: "inventory/ingredients/:id/edit", element: <IngredientFormPage /> },
         ],
       },
     ],

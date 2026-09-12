@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Index, String, Text
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, declared_attr, mapped_column, relationship
 
 from app.db.base import Base
 from app.db.columns import QUANTITY
@@ -40,6 +40,15 @@ class Ingredient(Base, TimestampMixin, VersionMixin):
         ),
         Index("ix_ingredients_business_id_is_active", "business_id", "is_active"),
     )
+
+    # Optimistic concurrency (Spec §8.33 explicitly names Ingredient; Phase 4 Plan v4 §4) —
+    # applied per-class, not on VersionMixin itself, matching the Product/SellingOption
+    # precedent exactly. The `version` column itself already existed (VersionMixin, Phase
+    # 1) but was never wired into `__mapper_args__` until now — this is a pure ORM-mapper
+    # change, no migration.
+    @declared_attr.directive
+    def __mapper_args__(cls) -> dict:
+        return {"version_id_col": cls.version}
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     business_id: Mapped[uuid.UUID] = mapped_column(

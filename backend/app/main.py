@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.api.v1.account import router as account_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.customers import router as customers_router
+from app.api.v1.ingredients import router as ingredients_router
 from app.api.v1.products import router as products_router
 from app.core.api_errors import register_api_error_handlers
 from app.core.config import get_settings
@@ -37,6 +38,7 @@ register_rate_limiting(app)
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(account_router, prefix="/api/v1", tags=["account"])
 app.include_router(customers_router, prefix="/api/v1/customers", tags=["customers"])
+app.include_router(ingredients_router, prefix="/api/v1/ingredients", tags=["ingredients"])
 app.include_router(products_router, prefix="/api/v1/products", tags=["products"])
 
 
