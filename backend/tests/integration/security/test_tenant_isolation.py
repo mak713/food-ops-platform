@@ -585,3 +585,162 @@ def test_product_list_never_leaks_foreign_tenant_rows(client):
     assert listing.status_code == 200
     assert listing.json()["total"] == 0
     assert listing.json()["items"] == []
+
+
+# --- Phase 5: Ingredient inventory ----------------------------------------------------
+
+
+def test_foreign_tenant_cannot_mutate_ingredient_inventory(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    ingredient = client.post(
+        "/api/v1/ingredients",
+        json={"name": "Business A Flour", "measurement_family": "WEIGHT", "canonical_unit": "g"},
+        headers=csrf_headers(client),
+    ).json()
+
+    _use_session(client, tenants["b"])
+    headers_b = csrf_headers(client)
+    base = f"/api/v1/ingredients/{ingredient['id']}/inventory"
+
+    initial_balance = client.post(
+        f"{base}/initial-balance",
+        json={"version": 1, "quantity": "10", "unit": "g", "unit_cost": "1"},
+        headers=headers_b,
+    )
+    restock = client.post(
+        f"{base}/restock",
+        json={"version": 1, "quantity": "10", "unit": "g", "unit_cost": "1"},
+        headers=headers_b,
+    )
+    adjustment = client.post(
+        f"{base}/adjustments",
+        json={"version": 1, "quantity_change": "-1", "reason": "OTHER"},
+        headers=headers_b,
+    )
+    replacement_cost = client.put(
+        f"{base}/replacement-cost",
+        json={"version": 1, "replacement_unit_cost": "5"},
+        headers=headers_b,
+    )
+    assert initial_balance.status_code == 404
+    assert restock.status_code == 404
+    assert adjustment.status_code == 404
+    assert replacement_cost.status_code == 404
+
+    _use_session(client, tenants["a"])
+    still_owned = client.get(f"/api/v1/ingredients/{ingredient['id']}")
+    assert still_owned.status_code == 200
+    assert still_owned.json()["physical_quantity"] == "0.000000"
+    assert still_owned.json()["version"] == 1
+
+
+def test_foreign_tenant_cannot_read_ingredient_inventory_history(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    ingredient = client.post(
+        "/api/v1/ingredients",
+        json={"name": "Business A Flour", "measurement_family": "WEIGHT", "canonical_unit": "g"},
+        headers=csrf_headers(client),
+    ).json()
+    client.post(
+        f"/api/v1/ingredients/{ingredient['id']}/inventory/initial-balance",
+        json={"version": 1, "quantity": "10", "unit": "g", "unit_cost": "1"},
+        headers=csrf_headers(client),
+    )
+
+    _use_session(client, tenants["b"])
+    foreign = client.get(f"/api/v1/ingredients/{ingredient['id']}/inventory/transactions")
+    missing = client.get(
+        "/api/v1/ingredients/00000000-0000-0000-0000-000000000000/inventory/transactions"
+    )
+    assert foreign.status_code == missing.status_code == 404
+    foreign_error = {k: v for k, v in foreign.json()["error"].items() if k != "request_id"}
+    missing_error = {k: v for k, v in missing.json()["error"].items() if k != "request_id"}
+    assert foreign_error == missing_error
+
+
+# --- Phase 5: Purchased Product Inventory ----------------------------------------------
+
+
+def test_foreign_tenant_cannot_mutate_purchased_inventory(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    product = client.post(
+        "/api/v1/products",
+        json={"name": "Business A Cans", "product_type": "PURCHASED"},
+        headers=csrf_headers(client),
+    ).json()
+
+    _use_session(client, tenants["b"])
+    headers_b = csrf_headers(client)
+    base = f"/api/v1/products/{product['id']}/purchased-inventory"
+
+    get_response = client.get(base)
+    initial_balance = client.post(
+        f"{base}/initial-balance", json={"quantity": "10", "unit_cost": "1"}, headers=headers_b
+    )
+    restock = client.post(
+        f"{base}/restock", json={"quantity": "10", "unit_cost": "1"}, headers=headers_b
+    )
+    adjustment = client.post(
+        f"{base}/adjustments",
+        json={"version": 1, "quantity_change": "-1", "reason": "OTHER"},
+        headers=headers_b,
+    )
+    replacement_cost = client.put(
+        f"{base}/replacement-cost",
+        json={"version": 1, "replacement_unit_cost": "5"},
+        headers=headers_b,
+    )
+    assert get_response.status_code == 404
+    assert initial_balance.status_code == 404
+    assert restock.status_code == 404
+    assert adjustment.status_code == 404
+    assert replacement_cost.status_code == 404
+
+    _use_session(client, tenants["a"])
+    still_absent = client.get(base)
+    assert still_absent.status_code == 404
+    assert still_absent.json()["error"]["code"] == "PURCHASED_INVENTORY_NOT_INITIALIZED"
+
+
+def test_foreign_tenant_cannot_read_purchased_inventory_history(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    product = client.post(
+        "/api/v1/products",
+        json={"name": "Business A Cans", "product_type": "PURCHASED"},
+        headers=csrf_headers(client),
+    ).json()
+    client.post(
+        f"/api/v1/products/{product['id']}/purchased-inventory/initial-balance",
+        json={"quantity": "10", "unit_cost": "1"},
+        headers=csrf_headers(client),
+    )
+
+    _use_session(client, tenants["b"])
+    foreign = client.get(f"/api/v1/products/{product['id']}/purchased-inventory/transactions")
+    missing = client.get(
+        "/api/v1/products/00000000-0000-0000-0000-000000000000/purchased-inventory/transactions"
+    )
+    assert foreign.status_code == missing.status_code == 404
+    foreign_error = {k: v for k, v in foreign.json()["error"].items() if k != "request_id"}
+    missing_error = {k: v for k, v in missing.json()["error"].items() if k != "request_id"}
+    assert foreign_error == missing_error
+
+
+def test_top_level_purchased_inventory_list_never_leaks_foreign_tenant_rows(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    client.post(
+        "/api/v1/products",
+        json={"name": "Business A Only", "product_type": "PURCHASED"},
+        headers=csrf_headers(client),
+    )
+
+    _use_session(client, tenants["b"])
+    listing = client.get("/api/v1/purchased-inventory")
+    assert listing.status_code == 200
+    assert listing.json()["total"] == 0
+    assert listing.json()["items"] == []

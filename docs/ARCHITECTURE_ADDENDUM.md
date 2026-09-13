@@ -439,3 +439,197 @@ depend on, or leak into, whatever ambient `decimal.getcontext()` precision the c
 have set. Later phases' own domain calculators (demand aggregation, surplus allocation, planned
 costing, etc.) are expected to live under this same package and meet this same
 self-contained-context bar, not just the "pure function, no I/O" half of it.
+
+### ADR-110 — Initial Balance: One-Time Physical/Cost-Basis Seeding, Not a Purchase Event
+
+"Initial Balance" (Ingredient and Purchased Product Inventory) represents inventory that
+already physically existed at the moment inventory tracking began for that resource — it is
+a one-time seeding operation, not an ordinary purchase. Once any inventory transaction of
+any type exists for a resource, Initial Balance may never be used again for that resource;
+the request is rejected outright rather than falling back to a different behavior. It
+requires a strictly positive starting quantity and a non-negative cost basis, and it sets
+exactly two fields: physical quantity and weighted-average unit cost. Because it is not
+evidence that an actual purchase occurred, Initial Balance never sets Latest Purchase Cost
+and never creates a Replacement Cost override — both remain NULL after Initial Balance,
+distinguishing "we know a cost basis" from "we know a market/purchase price."
+
+For Ingredient, the existing versioned Ingredient aggregate (ADR-104) is mutated in place, so
+an Initial Balance request carries and checks the caller's expected `version` like any other
+Ingredient mutation. The one-time-only check ("has any transaction ever been recorded") is a
+check-then-act race against a second, concurrent Initial Balance attempt on the same
+never-yet-initialized Ingredient — a version check alone does not serialize this, since both
+concurrent requests can legitimately observe the same pre-initialization version before
+either writes. The Ingredient row is therefore locked (`SELECT ... FOR UPDATE`) narrowly,
+only for the duration of this one call, so the check and the write happen atomically with
+respect to a competing Initial Balance call; every other Ingredient inventory mutation
+(Restock, Manual Adjustment, Replacement Cost) uses the existing unlocked version-checked
+path, since none of them has this same check-then-act existence race.
+
+For Purchased Product Inventory, no inventory row — and therefore no inventory `version` —
+exists before Initial Balance (or a legitimate first Restock, ADR-113) creates it.
+Serialization for that creation race is via the shared parent-Product lock, per ADR-106's
+shared-ancestor-locking pattern, not via any inventory-row version, since none exists yet to
+lock or check.
+
+### ADR-111 — Non-Positive Pre-Restock Ingredient Balances Do Not Participate in the Weighted-Average Blend
+
+For an Ingredient Restock where the physical quantity on hand immediately before the restock
+is strictly positive, the standard weighted-average formula (Spec §15.3) applies without
+modification. Where that pre-restock quantity is zero or negative, the new weighted-average
+unit cost is instead set directly to the restock's own normalized incoming purchase unit
+cost — the prior quantity and prior weighted-average cost are both discarded from the blend
+entirely, not merely down-weighted. A zero-or-negative balance is treated as a
+deficit/reconciliation state rather than positively-valued inventory available to participate
+in the blend, and therefore receives no quantity/cost weight in it — blending a deficit's
+stale cost into a real purchase's cost would produce a mathematically misleading weighted
+average. This rule applies uniformly regardless of which legitimate inventory event produced
+the zero/negative state: Phase 5 can produce one through Manual Adjustment (ADR-114), and a
+later Production phase may produce one through real Production Consumption; neither source
+changes this approved weighted-average behavior, since the rule depends only on the sign of
+the pre-restock balance, never on how that balance came to be. This rule is scoped to the
+weighted-average calculation only — it does not change how the resulting physical quantity
+itself is computed (still `old_quantity + purchased_quantity`, whatever sign that lands on).
+
+### ADR-112 — Replacement Cost Is a Fallback-Chained, Nullable-Column Override With No Separate Provenance Column
+
+Both Ingredient and Purchased Product Inventory expose a `replacement_unit_cost` column that
+is itself the complete override-state signal — no separate boolean/provenance column exists
+or is needed to distinguish "no override" from "override present." `replacement_unit_cost IS
+NULL` means no explicit override exists, and the effective replacement cost falls back to
+`latest_purchase_unit_cost` (itself NULL, and therefore an unknown/unset effective value,
+until at least one Restock has occurred). `replacement_unit_cost IS NOT NULL` means the
+seller has explicitly taken over maintenance of that value, and it is used as-is. A Restock
+always updates `latest_purchase_unit_cost`, and never writes to `replacement_unit_cost` under
+any circumstance — an explicit override, once set, survives every subsequent restock until
+the seller explicitly changes or clears it. The seller sets or clears the override through the
+dedicated Replacement Cost maintenance action; clearing means writing an explicit `NULL`,
+restoring automatic fallback to Latest Purchase Cost. The authoritative fallback rule —
+`replacement_unit_cost ?? latest_purchase_unit_cost` — is implemented once, as a shared pure
+domain helper (`resolve_effective_replacement_cost`); any future consumer of a planned/expected
+cost (e.g. a later Shopping List or planned-costing phase) must call this same helper rather
+than re-deriving the fallback logic independently.
+
+### ADR-113 — Purchased Product Inventory Joins the Optimistic-Concurrency Cohort; First-Row Creation Is Serialized Through the Parent Product Lock
+
+`PurchasedProductInventory`'s existing `version` column is wired through SQLAlchemy's
+`version_id_col` mechanism (`__mapper_args__`, the identical `@declared_attr.directive`
+pattern ADR-100 established and ADR-104 extended to Ingredient) — Spec §8.33 already scopes
+Purchased Product Inventory into the optimistic-concurrency cohort. For a Purchased Product
+Inventory row that already exists, every mutation (Restock, Manual Adjustment, Replacement
+Cost) requires the caller's expected inventory `version` and follows the same unlocked
+check-version-then-write shape already established for Ingredient — no Product-parent lock is
+taken merely to update an already-existing row.
+
+The row's creation is a distinct problem: before it exists, there is no `version` to check, so
+an absent inventory version on a request is not a validation gap — it is the caller's explicit
+assertion "I believe no row exists yet for this Product." That assertion is verified, not
+trusted: the shared parent `Product` row is locked first (ADR-106's shared-ancestor pattern),
+and only under that lock is the inventory row's absence re-checked. If another request has
+already created the row by the time the lock is acquired, the caller is rejected (`409`) and
+must refresh and retry against the now-existing row, rather than the system silently applying
+an unversioned write on top of a row it never actually observed. Both Initial Balance and a
+legitimate first-ever Restock (a first purchase may itself be the very first inventory event
+for a Purchased Product) are permitted to create the row this way, and each retains its own
+distinct transaction-type semantics (`INITIAL_BALANCE` vs. `RESTOCK`) — Restock's creation
+path does not become an Initial Balance merely because it happens to be first. The schema's
+`UNIQUE(business_id, product_id)` constraint remains in place as a database-level backstop
+against this exact scenario, but is not the primary mechanism relied on to prevent a duplicate
+row — the Product lock is.
+
+### ADR-114 — Inventory Availability Under Archived/Inactive Master Data; Negative Ingredient Balances Represent Reality, Not a Production Workflow
+
+When an Ingredient is archived or a Purchased Product is inactive, its inventory remains
+fully readable — current balance, cost fields, and transaction history are never hidden or
+altered by the master-data state change — and Manual Adjustment remains available, since
+reconciling already-recorded stock is a legitimate need regardless of whether the resource is
+currently active for new use. Three actions are blocked until the resource is reactivated:
+Initial Balance, Restock, and explicit Replacement Cost set/clear — all three represent
+bringing new stock or new forward-looking cost data onto a resource the seller has
+deliberately taken out of active use, which reactivation is the intended gate for. This policy
+never deletes or hides any historical inventory truth.
+
+Ingredient physical quantity may become negative as a direct result of Manual Adjustment, and
+Phase 5 represents that resulting value exactly as computed — it is never clamped to zero and
+never blocked from going negative. The UI surfaces a generic reconciliation-attention state
+whenever an Ingredient's balance is negative. This is a display treatment of whatever value
+Manual Adjustment (or, in a later phase, real Production Consumption) has produced — it is not
+itself a production or consumption workflow, and Phase 5 implements no such workflow.
+Purchased Product Inventory has no equivalent negative-balance concept: its physical quantity
+remains non-negative, enforced by both an application-level pre-check and the schema's
+existing `CHECK` constraint as a backstop.
+
+Phase 5 implements Initial Balance, Restock, Manual Adjustment, Replacement Cost maintenance,
+and inventory history for Ingredient and Purchased Product Inventory only. It does not
+implement Ingredient or Purchased Product reservations, Orders, operational recalculation,
+Shopping List derivation, Production Requirements/Runs, Start/Finish Production, the
+`PRODUCTION_CONSUMPTION` or `ORDER_FULFILLMENT` transaction workflows, Surplus, readiness, or
+analytics. The `InventoryTransaction`/`PurchasedProductInventoryTransaction` schemas'
+pre-existing enum values for those later transaction types (established at the Phase 1
+migration) are schema readiness for future phases, not evidence that those workflows exist
+yet.
+
+### ADR-115 — Phase 5 Decimal Persistence Convention: Unrounded Calculators, One Quantization Point, `ROUND_HALF_UP`, Application-Level Representability Validation
+
+Phase 5 is the first phase whose domain calculators produce a derived (converted, blended, or
+multiplied) Decimal result that is itself persisted, rather than a raw already-bounded request
+value passing straight through. The following convention governs every Phase 5 inventory value
+persisted into the applicable `NUMERIC(18,6)` quantity/unit-cost/transaction fields.
+
+The durable, cross-phase architectural principles this convention establishes — and that later
+phases introducing their own derived, persisted Decimal results must also follow — are: Decimal-
+only arithmetic; explicit, fixed local Decimal contexts; deterministic calculations with no
+dependence on ambient Decimal context; avoiding premature rounding; and explicitly quantizing
+only when a value crosses into a persisted fixed-precision representation, at the precision and
+scale appropriate to that value's own authoritative destination column. The specific six-decimal
+quantization and `ROUND_HALF_UP` rounding mode below are the Phase 5 inventory rule for its own
+`NUMERIC(18,6)` columns — they are not a claim that every future persisted Decimal value must
+also be stored at six decimal places. A future phase persisting a derived value into a
+differently-scaled authoritative column (e.g. a `NUMERIC(14,2)` money field) follows this same
+calculation/persistence *pattern* while honoring that column's own precision/scale and whatever
+domain-specific rounding rule is explicitly approved for it, rather than reusing Phase 5's
+six-decimal figure by default.
+
+Domain calculators (`app/domain/inventory_costing.py`, and `unit_conversion.py`'s
+cost-conversion addition) remain pure per ADR-109 — Decimal-only arithmetic inside their own
+explicit `decimal.localcontext()` — and return full, unrounded precision; they never round
+internally. Exactly one quantization point exists for each derived value, at the service
+layer, immediately before that value is assigned to a `NUMERIC(18,6)`-backed column:
+`Decimal.quantize(Decimal("0.000001"), rounding=decimal.ROUND_HALF_UP)`. `ROUND_HALF_UP`
+(round-half-away-from-zero) is the chosen mode everywhere this quantization occurs, rather
+than Python's own `Decimal` default of round-half-to-even, since a seller reading a cost
+ledger expects ordinary rounding behavior.
+
+For a restock's ledger entry specifically, the normalized quantity and normalized unit cost
+are each quantized to their persisted six-decimal value first, and `total_cost` is computed
+from those two already-quantized, already-persisted values and quantized once more — never
+computed from unrounded intermediates. This trades a theoretically tiny amount of compounded
+rounding for a stronger auditability guarantee: a transaction row's stored `total_cost` is
+always exactly the arithmetic product of that same row's own stored quantity and unit cost,
+verifiable by inspection without re-deriving intermediate precision no longer on the row.
+
+Every derived value is validated for `NUMERIC(18,6)` representability at the application
+layer before it is persisted, using a shared deterministic helper
+(`is_representable_in_numeric_18_6`); a value that would not fit is rejected with a clean
+`4xx` before any write is attempted. The database column's own type/constraints remain a
+backstop against a bug in that validation, never the primary, user-facing failure mode. A raw
+client-submitted value can never violate this bound (request-schema validation already
+constrains it), but a converted quantity, a converted unit cost, a weighted-average result, or
+a computed `total_cost` can, through unit-conversion multiplication or through combining two
+independently-valid stored values. Distinctly, a strictly positive converted Ingredient
+quantity that would quantize to `0.000000` at six-decimal storage precision is rejected
+outright rather than silently recording a zero-quantity inventory event — a positive physical
+action must never appear in the ledger or the balance as if nothing happened.
+
+### ADR-116 — Inventory Current State and Historical Ledger Commit Atomically; the Ledger Is Immutable and Never Summed to Reconstruct Current State
+
+For both Ingredient and Purchased Product Inventory, the current physical balance and cost
+fields (on the `Ingredient`/`PurchasedProductInventory` row itself) are stored,
+directly-read current state — not a value recomputed by summing the transaction ledger on
+every read. The `InventoryTransaction`/`PurchasedProductInventoryTransaction` rows are
+immutable historical/event truth: Phase 5 provides no edit or delete endpoint for either
+table, and none is anticipated for any future phase — a correction to inventory is itself
+recorded as a new Manual Adjustment transaction, never as a rewrite of a prior one. Every
+inventory-affecting operation (Initial Balance, Restock, Manual Adjustment) writes its
+balance/cost-field mutation and its corresponding transaction row within one atomic database
+transaction, committed together — there is no code path that can persist one without the
+other, whether the operation succeeds or is rejected partway through.

@@ -77,6 +77,33 @@ def convert(quantity: Decimal, from_unit: str, to_unit: str) -> Decimal:
         return canonical / to_factor
 
 
+def convert_unit_cost(unit_cost: Decimal, from_unit: str, to_unit: str) -> Decimal:
+    """Converts a *per-unit cost* (e.g. "$/lb") from `from_unit` to `to_unit` (e.g.
+    "$/g") — Spec §15.2/§15.3's "purchase unit cost must be normalized to the canonical
+    unit before applying the [weighted-average] formula" (Phase 5 Plan §C).
+
+    This is deliberately a distinct function from `convert`, not a reuse of it with
+    swapped arguments: a cost-per-unit is inversely proportional to a quantity conversion
+    for a fixed total spend (buying the same money's worth of a smaller unit costs less
+    per unit), so converting a cost divides by the same factor a quantity conversion would
+    multiply by. Raises `UnknownUnitError`/`IncompatibleUnitFamilyError` exactly as
+    `convert` does. Returns the full-precision result with no rounding — rounding a
+    persisted value is a service/schema-layer concern (Phase 5 Plan §J-1), not this
+    module's."""
+    from_family, from_factor = _resolve(from_unit)
+    to_family, to_factor = _resolve(to_unit)
+    if from_family is not to_family:
+        raise IncompatibleUnitFamilyError(
+            f"Cannot convert {from_unit!r} ({from_family}) to {to_unit!r} ({to_family})"
+        )
+    with decimal.localcontext() as ctx:
+        ctx.prec = _CONTEXT_PRECISION
+        # cost per canonical unit = unit_cost / from_factor; cost per to_unit = that
+        # times to_factor. Computed as one multiply-then-divide, not two separate steps,
+        # so no intermediate result is ever implicitly rounded by the arithmetic itself.
+        return (unit_cost * to_factor) / from_factor
+
+
 def _resolve(unit: str) -> tuple[MeasurementFamily, Decimal]:
     entry = _UNIT_FACTORS.get(unit)
     if entry is None:

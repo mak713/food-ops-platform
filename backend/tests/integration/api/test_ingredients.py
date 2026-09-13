@@ -30,11 +30,13 @@ def test_create_ingredient(client):
     assert body["canonical_unit"] == "g"
     assert body["is_active"] is True
     assert body["version"] == 1
-    # No Phase 5 cost/quantity fields anywhere in the response (Phase 4 Plan v4 §4).
-    assert "physical_quantity" not in body
-    assert "weighted_average_unit_cost" not in body
-    assert "latest_purchase_unit_cost" not in body
-    assert "replacement_unit_cost" not in body
+    # A freshly-created Ingredient starts at the schema's own zero/null defaults — no
+    # inventory activity has happened yet (Phase 5 Plan §C/§D).
+    assert body["physical_quantity"] == "0.000000"
+    assert body["weighted_average_unit_cost"] == "0.000000"
+    assert body["latest_purchase_unit_cost"] is None
+    assert body["replacement_unit_cost"] is None
+    assert body["effective_replacement_cost"] is None
 
 
 def test_create_ingredient_in_each_measurement_family(client):

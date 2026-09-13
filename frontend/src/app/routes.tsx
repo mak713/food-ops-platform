@@ -13,9 +13,22 @@ import { SignupPage } from "../features/auth/SignupPage";
 import { CustomerDetailPage } from "../features/customers/CustomerDetailPage";
 import { CustomerFormPage } from "../features/customers/CustomerFormPage";
 import { CustomerListPage } from "../features/customers/CustomerListPage";
+import { IngredientAdjustPage } from "../features/ingredients/IngredientAdjustPage";
 import { IngredientDetailPage } from "../features/ingredients/IngredientDetailPage";
 import { IngredientFormPage } from "../features/ingredients/IngredientFormPage";
+import { IngredientInitialBalancePage } from "../features/ingredients/IngredientInitialBalancePage";
+import { IngredientInventoryHistoryPage } from "../features/ingredients/IngredientInventoryHistoryPage";
 import { IngredientListPage } from "../features/ingredients/IngredientListPage";
+import { IngredientReplacementCostPage } from "../features/ingredients/IngredientReplacementCostPage";
+import { IngredientRestockPage } from "../features/ingredients/IngredientRestockPage";
+import { InventoryHistoryPage } from "../features/inventory/InventoryHistoryPage";
+import { InventoryHubPage } from "../features/inventory/InventoryHubPage";
+import { PurchasedAdjustPage } from "../features/inventory/PurchasedAdjustPage";
+import { PurchasedInitialBalancePage } from "../features/inventory/PurchasedInitialBalancePage";
+import { PurchasedInventoryHistoryPage } from "../features/inventory/PurchasedInventoryHistoryPage";
+import { PurchasedProductInventoryListPage } from "../features/inventory/PurchasedProductInventoryListPage";
+import { PurchasedReplacementCostPage } from "../features/inventory/PurchasedReplacementCostPage";
+import { PurchasedRestockPage } from "../features/inventory/PurchasedRestockPage";
 import { ProductDetailPage } from "../features/products/ProductDetailPage";
 import { ProductFormPage } from "../features/products/ProductFormPage";
 import { ProductListPage } from "../features/products/ProductListPage";
@@ -56,7 +69,7 @@ function AppLayout() {
           <Link to="/app/products" className="text-muted-foreground hover:text-foreground">
             Products
           </Link>
-          <Link to="/app/inventory/ingredients" className="text-muted-foreground hover:text-foreground">
+          <Link to="/app/inventory" className="text-muted-foreground hover:text-foreground">
             Inventory
           </Link>
           <Link to="/app/account" className="text-muted-foreground hover:text-foreground">
@@ -128,10 +141,50 @@ export const routes: RouteObject[] = [
             path: "products/:id/recipe/revisions/:revisionId",
             element: <RecipeRevisionDetailPage />,
           },
+          { path: "inventory", element: <InventoryHubPage /> },
           { path: "inventory/ingredients", element: <IngredientListPage /> },
           { path: "inventory/ingredients/new", element: <IngredientFormPage /> },
           { path: "inventory/ingredients/:id", element: <IngredientDetailPage /> },
           { path: "inventory/ingredients/:id/edit", element: <IngredientFormPage /> },
+          {
+            path: "inventory/ingredients/:id/initial-balance",
+            element: <IngredientInitialBalancePage />,
+          },
+          { path: "inventory/ingredients/:id/restock", element: <IngredientRestockPage /> },
+          { path: "inventory/ingredients/:id/adjust", element: <IngredientAdjustPage /> },
+          {
+            path: "inventory/ingredients/:id/replacement-cost",
+            element: <IngredientReplacementCostPage />,
+          },
+          {
+            path: "inventory/ingredients/:id/history",
+            element: <IngredientInventoryHistoryPage />,
+          },
+          {
+            path: "inventory/purchased-products",
+            element: <PurchasedProductInventoryListPage />,
+          },
+          {
+            path: "inventory/purchased-products/:id/initial-balance",
+            element: <PurchasedInitialBalancePage />,
+          },
+          {
+            path: "inventory/purchased-products/:id/restock",
+            element: <PurchasedRestockPage />,
+          },
+          {
+            path: "inventory/purchased-products/:id/adjust",
+            element: <PurchasedAdjustPage />,
+          },
+          {
+            path: "inventory/purchased-products/:id/replacement-cost",
+            element: <PurchasedReplacementCostPage />,
+          },
+          {
+            path: "inventory/purchased-products/:id/history",
+            element: <PurchasedInventoryHistoryPage />,
+          },
+          { path: "inventory/history", element: <InventoryHistoryPage /> },
         ],
       },
     ],

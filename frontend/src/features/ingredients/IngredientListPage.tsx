@@ -23,6 +23,7 @@ import {
   TableHeader,
   TableRow,
 } from "../../components/ui/table";
+import { formatDecimal } from "../../lib/decimal";
 import { ingredientsApi } from "./api";
 
 type ActiveFilter = "active" | "archived" | "all";
@@ -94,29 +95,39 @@ export function IngredientListPage() {
               <TableHead>Name</TableHead>
               <TableHead>Family</TableHead>
               <TableHead>Canonical unit</TableHead>
+              <TableHead>Physical quantity</TableHead>
               <TableHead>Status</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {query.data.items.map((ingredient) => (
-              <TableRow key={ingredient.id}>
-                <TableCell>
-                  <Link
-                    to={`/app/inventory/ingredients/${ingredient.id}`}
-                    className="font-medium underline-offset-4 hover:underline"
-                  >
-                    {ingredient.name}
-                  </Link>
-                </TableCell>
-                <TableCell>{ingredient.measurement_family}</TableCell>
-                <TableCell>{ingredient.canonical_unit}</TableCell>
-                <TableCell>
-                  <Badge variant={ingredient.is_active ? "default" : "secondary"}>
-                    {ingredient.is_active ? "Active" : "Archived"}
-                  </Badge>
-                </TableCell>
-              </TableRow>
-            ))}
+            {query.data.items.map((ingredient) => {
+              const isNegative = Number(ingredient.physical_quantity) < 0;
+              return (
+                <TableRow key={ingredient.id}>
+                  <TableCell>
+                    <Link
+                      to={`/app/inventory/ingredients/${ingredient.id}`}
+                      className="font-medium underline-offset-4 hover:underline"
+                    >
+                      {ingredient.name}
+                    </Link>
+                  </TableCell>
+                  <TableCell>{ingredient.measurement_family}</TableCell>
+                  <TableCell>{ingredient.canonical_unit}</TableCell>
+                  <TableCell className="flex items-center gap-2">
+                    <span className={isNegative ? "font-medium text-destructive" : undefined}>
+                      {formatDecimal(ingredient.physical_quantity)}
+                    </span>
+                    {isNegative && <Badge variant="destructive">Needs reconciliation</Badge>}
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant={ingredient.is_active ? "default" : "secondary"}>
+                      {ingredient.is_active ? "Active" : "Archived"}
+                    </Badge>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
           </TableBody>
         </Table>
       )}

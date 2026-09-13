@@ -1,4 +1,5 @@
-"""Request/response schemas for the Ingredient resource (Phase 4 Plan v4 §4).
+"""Request/response schemas for the Ingredient resource (Phase 4 Plan v4 §4; Phase 5 Plan
+§C adds the physical-quantity/cost-basis fields Phase 4 deliberately excluded).
 
 `measurement_family`/`canonical_unit` are immutable after creation (mirrors
 `Product.product_type`'s immutability precedent) — validated for mutual consistency only
@@ -6,6 +7,8 @@ at creation, via the same closed unit set `UnitConversion` already enforces (Spe
 """
 
 from __future__ import annotations
+
+from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -82,6 +85,11 @@ class IngredientResponse(BaseModel):
     canonical_unit: str
     is_active: bool
     version: int
+    physical_quantity: Decimal
+    weighted_average_unit_cost: Decimal
+    latest_purchase_unit_cost: Decimal | None
+    replacement_unit_cost: Decimal | None
+    effective_replacement_cost: Decimal | None
 
 
 class IngredientSummary(BaseModel):
@@ -93,3 +101,4 @@ class IngredientSummary(BaseModel):
     canonical_unit: str
     is_active: bool
     version: int
+    physical_quantity: Decimal

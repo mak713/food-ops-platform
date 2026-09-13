@@ -27,6 +27,7 @@ import {
   TableRow,
 } from "../../components/ui/table";
 import { formatDecimal } from "../../lib/decimal";
+import { purchasedInventoryApi } from "../inventory/purchasedInventoryApi";
 import { productsApi } from "./api";
 import { NewSellingOptionForm } from "./NewSellingOptionForm";
 import { recipeApi } from "./recipeApi";
@@ -71,6 +72,13 @@ export function ProductDetailPage() {
     queryKey: ["products", id, "recipe"],
     queryFn: () => recipeApi.get(id as string),
     enabled: query.data?.product_type === "PRODUCED",
+    retry: false,
+  });
+
+  const purchasedInventoryQuery = useQuery({
+    queryKey: ["products", id, "purchased-inventory"],
+    queryFn: () => purchasedInventoryApi.get(id as string),
+    enabled: query.data?.product_type === "PURCHASED",
     retry: false,
   });
 
@@ -347,6 +355,123 @@ export function ProductDetailPage() {
                 </Link>
                 <Link
                   to={`/app/products/${product.id}/recipe/history`}
+                  className="text-sm underline-offset-4 hover:underline"
+                >
+                  View History
+                </Link>
+              </div>
+            </>
+          ) : null}
+        </div>
+      )}
+
+      {product.product_type === "PURCHASED" && (
+        <div className="flex flex-col gap-3">
+          <h2 className="text-lg font-semibold">Purchased Inventory</h2>
+
+          {purchasedInventoryQuery.isLoading ? (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : purchasedInventoryQuery.isError ? (
+            purchasedInventoryQuery.error instanceof ApiError &&
+            purchasedInventoryQuery.error.status === 404 ? (
+              <div className="flex items-center gap-3">
+                <p className="text-sm text-muted-foreground">
+                  No inventory recorded yet.
+                </p>
+                {product.is_active ? (
+                  <>
+                    <Link
+                      to={`/app/inventory/purchased-products/${product.id}/initial-balance`}
+                      className="text-sm underline-offset-4 hover:underline"
+                    >
+                      Record Initial Balance
+                    </Link>
+                    <Link
+                      to={`/app/inventory/purchased-products/${product.id}/restock`}
+                      className="text-sm underline-offset-4 hover:underline"
+                    >
+                      Restock
+                    </Link>
+                  </>
+                ) : (
+                  <span className="text-sm text-muted-foreground">
+                    Reactivate this product to record an initial balance or restock.
+                  </span>
+                )}
+              </div>
+            ) : (
+              <ErrorBanner
+                error={purchasedInventoryQuery.error}
+                onRetry={() => purchasedInventoryQuery.refetch()}
+              />
+            )
+          ) : purchasedInventoryQuery.data ? (
+            <>
+              <dl className="flex flex-col gap-2 text-sm">
+                <div>
+                  <dt className="text-muted-foreground">Physical quantity</dt>
+                  <dd>{formatDecimal(purchasedInventoryQuery.data.physical_quantity)}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Weighted-average cost</dt>
+                  <dd>
+                    {formatDecimal(purchasedInventoryQuery.data.weighted_average_unit_cost)}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Latest purchase cost</dt>
+                  <dd>
+                    {purchasedInventoryQuery.data.latest_purchase_unit_cost != null
+                      ? formatDecimal(purchasedInventoryQuery.data.latest_purchase_unit_cost)
+                      : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Replacement cost</dt>
+                  <dd>
+                    {purchasedInventoryQuery.data.effective_replacement_cost != null ? (
+                      <>
+                        {formatDecimal(purchasedInventoryQuery.data.effective_replacement_cost)}{" "}
+                        <span className="text-xs text-muted-foreground">
+                          (
+                          {purchasedInventoryQuery.data.replacement_unit_cost != null
+                            ? "manually set"
+                            : "following latest purchase cost"}
+                          )
+                        </span>
+                      </>
+                    ) : (
+                      "—"
+                    )}
+                  </dd>
+                </div>
+              </dl>
+
+              <div className="flex flex-wrap items-center gap-3">
+                {product.is_active && (
+                  <Link
+                    to={`/app/inventory/purchased-products/${product.id}/restock`}
+                    className="text-sm underline-offset-4 hover:underline"
+                  >
+                    Restock
+                  </Link>
+                )}
+                <Link
+                  to={`/app/inventory/purchased-products/${product.id}/adjust`}
+                  className="text-sm underline-offset-4 hover:underline"
+                >
+                  Adjust
+                </Link>
+                {product.is_active && (
+                  <Link
+                    to={`/app/inventory/purchased-products/${product.id}/replacement-cost`}
+                    className="text-sm underline-offset-4 hover:underline"
+                  >
+                    Replacement Cost
+                  </Link>
+                )}
+                <Link
+                  to={`/app/inventory/purchased-products/${product.id}/history`}
                   className="text-sm underline-offset-4 hover:underline"
                 >
                   View History

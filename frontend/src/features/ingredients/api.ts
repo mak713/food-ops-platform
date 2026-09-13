@@ -1,7 +1,9 @@
-// Typed calls to the Phase 4 Ingredient endpoints (backend/app/api/v1/ingredients.py).
+// Typed calls to the Phase 4/5 Ingredient endpoints (backend/app/api/v1/ingredients.py).
 // Mirrors backend/app/schemas/ingredient.py's request/response shapes (established
-// hand-maintained-mirror convention — see features/customers/api.ts). No cost/quantity
-// fields anywhere — Phase 5 scope (Phase 4 Plan v4 §4/§10).
+// hand-maintained-mirror convention — see features/customers/api.ts). Physical-inventory
+// mutation endpoints (initial balance/restock/adjustment/replacement-cost/history) are
+// Phase 5's own `inventoryApi.ts`, not this file — this file only grew the four inventory
+// *display* fields Phase 4 deliberately excluded from the response.
 
 import { apiFetch } from "../../api/client";
 import type { PageResponse } from "../customers/api";
@@ -15,9 +17,24 @@ export interface Ingredient {
   canonical_unit: string;
   is_active: boolean;
   version: number;
+  physical_quantity: string;
+  weighted_average_unit_cost: string;
+  latest_purchase_unit_cost: string | null;
+  replacement_unit_cost: string | null;
+  effective_replacement_cost: string | null;
 }
 
-export type IngredientSummary = Ingredient;
+// The list/summary shape carries only Physical Quantity, not the three cost fields
+// (mirrors backend/app/schemas/ingredient.py::IngredientSummary exactly).
+export interface IngredientSummary {
+  id: string;
+  name: string;
+  measurement_family: MeasurementFamily;
+  canonical_unit: string;
+  is_active: boolean;
+  version: number;
+  physical_quantity: string;
+}
 
 export interface IngredientCreateRequest {
   name: string;
@@ -78,6 +95,21 @@ export const ingredientsApi = {
     const limit = 200; // the endpoint's own existing upper bound (Query(le=200))
     for (;;) {
       const page = await ingredientsApi.list({ is_active: true, limit, offset });
+      all.push(...page.items);
+      if (all.length >= page.total || page.items.length < limit) break;
+      offset += limit;
+    }
+    return all;
+  },
+  /** Every Ingredient regardless of active state — the Inventory History picker must
+   * still reach an archived Ingredient's history (Phase 5 Plan §F), unlike the Recipe
+   * selector's active-only `listAllActive` above. */
+  listAll: async (): Promise<IngredientSummary[]> => {
+    const all: IngredientSummary[] = [];
+    let offset = 0;
+    const limit = 200;
+    for (;;) {
+      const page = await ingredientsApi.list({ limit, offset });
       all.push(...page.items);
       if (all.length >= page.total || page.items.length < limit) break;
       offset += limit;

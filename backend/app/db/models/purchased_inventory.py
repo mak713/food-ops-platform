@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import CheckConstraint, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, declared_attr, mapped_column, relationship
 
 from app.db.base import Base
 from app.db.columns import QUANTITY
@@ -43,6 +43,15 @@ class PurchasedProductInventory(Base, TimestampMixin, VersionMixin):
             name="uq_purchased_product_inventory_business_id_product_id",
         ),
     )
+
+    # Optimistic concurrency (Spec §8.33 explicitly names Purchased Product Inventory;
+    # Phase 5 Plan §C/§J) — applied per-class, matching the Ingredient/Product/
+    # SellingOption precedent (ADR-100/ADR-104) exactly. The `version` column itself
+    # already existed (VersionMixin, Phase 1) but was never wired into `__mapper_args__`
+    # until now — this is a pure ORM-mapper change, no migration.
+    @declared_attr.directive
+    def __mapper_args__(cls) -> dict:
+        return {"version_id_col": cls.version}
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     business_id: Mapped[uuid.UUID] = mapped_column(

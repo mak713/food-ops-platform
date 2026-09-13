@@ -17,6 +17,7 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from app.core.api_errors import ApiError
 from app.core.tenant import (
+    NotFoundError,
     check_version,
     commit_or_raise_stale,
     get_owned_or_404,
@@ -31,6 +32,29 @@ def get_ingredient_for_business(
     db: Session, ingredient_id: uuid.UUID, business: Business
 ) -> Ingredient:
     return get_owned_or_404(db, Ingredient, ingredient_id, business)
+
+
+def get_ingredient_for_business_locked(
+    db: Session, ingredient_id: uuid.UUID, business: Business
+) -> Ingredient:
+    """Tenant-scoped `SELECT ... FOR UPDATE` on the Ingredient row (Phase 5 Plan §C) —
+    used only by `ingredient_inventory_service.create_initial_balance`, to serialize the
+    "has any InventoryTransaction ever been created for this Ingredient" check against a
+    concurrent second Initial Balance attempt on the same Ingredient. Every other
+    Ingredient inventory mutation (Restock, Adjustment, replacement-cost maintenance)
+    reads the row unlocked, since the Ingredient itself always already exists (created in
+    Phase 4) and the `version_id_col` mechanism alone is sufficient protection for an
+    ordinary update — this lock exists solely for the one check-then-act race version
+    checking alone cannot cover. Scoped by `(id, business_id)` in the query itself,
+    matching ADR-099/`get_product_for_business_locked` exactly."""
+    obj = db.scalar(
+        select(Ingredient)
+        .where(Ingredient.id == ingredient_id, Ingredient.business_id == business.id)
+        .with_for_update()
+    )
+    if obj is None:
+        raise NotFoundError()
+    return obj
 
 
 def lock_ingredients_for_business(

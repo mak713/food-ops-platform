@@ -72,6 +72,11 @@ const FLOUR = {
   canonical_unit: "g",
   is_active: true,
   version: 1,
+  physical_quantity: "0.000000",
+  weighted_average_unit_cost: "0.000000",
+  latest_purchase_unit_cost: null,
+  replacement_unit_cost: null,
+  effective_replacement_cost: null,
 };
 
 describe("Ingredient list", () => {

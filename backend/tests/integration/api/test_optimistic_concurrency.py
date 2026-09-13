@@ -28,16 +28,34 @@ from __future__ import annotations
 
 import threading
 
+from sqlalchemy import select
+
 from app.core.api_errors import ApiError
 from app.db.models.business import Business
 from app.db.models.customer import Customer
-from app.db.models.ingredient import Ingredient
+from app.db.models.ingredient import Ingredient, InventoryTransaction
 from app.db.models.product import Product
+from app.db.models.purchased_inventory import (
+    PurchasedProductInventory,
+    PurchasedProductInventoryTransaction,
+)
 from app.db.models.user import User
 from app.schemas.customer import CustomerUpdateRequest
 from app.schemas.ingredient import IngredientUpdateRequest
+from app.schemas.inventory import (
+    IngredientInitialBalanceRequest,
+    IngredientRestockRequest,
+    PurchasedInitialBalanceRequest,
+    PurchasedRestockRequest,
+)
 from app.schemas.product import ProductUpdateRequest
-from app.services import customer_service, ingredient_service, product_service
+from app.services import (
+    customer_service,
+    ingredient_inventory_service,
+    ingredient_service,
+    product_service,
+    purchased_inventory_service,
+)
 from tests.integration.schema.factories import (
     make_business_graph,
     make_customer,
@@ -254,6 +272,167 @@ def test_service_layer_concurrent_ingredient_update_translates_to_stale_version_
             real_session_factory,
             row_model=Ingredient,
             row_id=ingredient_id,
+            business_id=business_id,
+            owner_id=owner_id,
+        )
+
+
+def test_service_layer_concurrent_ingredient_restock_translates_to_stale_version_api_error(
+    real_session_factory,
+):
+    """Phase 5 Plan §G: an ordinary Restock against an *already-initialized* Ingredient
+    takes no row lock at all — this proves `version_id_col` alone is sufficient to
+    prevent a lost update under genuine concurrency, exactly like the plain-CRUD races
+    above."""
+    setup_db = real_session_factory()
+    try:
+        business = make_business_graph(setup_db)
+        ingredient = make_ingredient(setup_db, business, name="Race Sugar")
+        setup_db.commit()
+        ingredient_inventory_service.create_initial_balance(
+            setup_db,
+            business,
+            ingredient.id,
+            IngredientInitialBalanceRequest(version=1, quantity="100", unit="g", unit_cost="1"),
+        )
+        ingredient_id = ingredient.id
+        business_id = business.id
+        owner_id = business.owner_user_id
+        starting_version = ingredient.version
+    finally:
+        setup_db.close()
+
+    def run_update(db, business, row_id) -> None:
+        payload = IngredientRestockRequest(
+            version=starting_version, quantity="1", unit="g", unit_cost="5"
+        )
+        ingredient_inventory_service.restock_ingredient(db, business, row_id, payload)
+
+    try:
+        results = _run_service_version_race(
+            real_session_factory, run_update, ingredient_id, business_id
+        )
+        oks = [r for kind, r in results if kind == "ok"]
+        api_errors = [r for kind, r in results if kind == "api_error"]
+        assert len(oks) == 1, f"expected exactly one winner, got {results}"
+        assert len(api_errors) == 1, f"expected exactly one ApiError, got {results}"
+
+        stale_error = api_errors[0]
+        assert isinstance(stale_error, ApiError)
+        assert stale_error.status_code == 409
+        assert stale_error.code == "STALE_VERSION"
+
+        verify_db = real_session_factory()
+        try:
+            final = verify_db.get(Ingredient, ingredient_id)
+            # Exactly one restock applied — 100 + 1 = 101, never 102 (a lost update
+            # would double-apply, and a corrupted read would apply neither correctly).
+            assert final.physical_quantity == 101
+            assert final.version == starting_version + 1
+        finally:
+            verify_db.close()
+    finally:
+        # Delete the InventoryTransaction rows first — `ondelete="NO ACTION"` on
+        # `inventory_transactions.ingredient_id` blocks deleting the Ingredient while any
+        # reference it (Phase 5's Initial Balance/Restock both leave one behind).
+        cleanup = real_session_factory()
+        try:
+            for txn in cleanup.scalars(
+                select(InventoryTransaction).where(
+                    InventoryTransaction.ingredient_id == ingredient_id
+                )
+            ):
+                cleanup.delete(txn)
+            cleanup.commit()
+        finally:
+            cleanup.close()
+        _cleanup_business_graph(
+            real_session_factory,
+            row_model=Ingredient,
+            row_id=ingredient_id,
+            business_id=business_id,
+            owner_id=owner_id,
+        )
+
+
+def test_service_layer_concurrent_purchased_inventory_restock_translates_to_stale_version_api_error(
+    real_session_factory,
+):
+    """Phase 5 Plan §G: an ordinary Restock against an *already-existing*
+    `PurchasedProductInventory` row takes no Product lock at all (that lock is reserved
+    for the row's own creation) — this proves `version_id_col`, freshly wired onto this
+    model for Phase 5, alone prevents a lost update under genuine concurrency."""
+    setup_db = real_session_factory()
+    try:
+        business = make_business_graph(setup_db)
+        product = make_product(setup_db, business, product_type="PURCHASED", name="Race Cans")
+        setup_db.commit()
+        inventory = purchased_inventory_service.create_initial_balance(
+            setup_db,
+            business,
+            product.id,
+            PurchasedInitialBalanceRequest(quantity="100", unit_cost="1"),
+        )
+        product_id = product.id
+        business_id = business.id
+        owner_id = business.owner_user_id
+        starting_version = inventory.version
+    finally:
+        setup_db.close()
+
+    def run_update(db, business, row_id) -> None:
+        payload = PurchasedRestockRequest(version=starting_version, quantity="1", unit_cost="5")
+        purchased_inventory_service.restock_purchased_product(db, business, row_id, payload)
+
+    try:
+        results = _run_service_version_race(
+            real_session_factory, run_update, product_id, business_id
+        )
+        oks = [r for kind, r in results if kind == "ok"]
+        api_errors = [r for kind, r in results if kind == "api_error"]
+        assert len(oks) == 1, f"expected exactly one winner, got {results}"
+        assert len(api_errors) == 1, f"expected exactly one ApiError, got {results}"
+
+        stale_error = api_errors[0]
+        assert isinstance(stale_error, ApiError)
+        assert stale_error.status_code == 409
+        assert stale_error.code == "STALE_VERSION"
+
+        verify_db = real_session_factory()
+        try:
+            final = verify_db.scalar(
+                select(PurchasedProductInventory).where(
+                    PurchasedProductInventory.product_id == product_id
+                )
+            )
+            assert final.physical_quantity == 101
+            assert final.version == starting_version + 1
+        finally:
+            verify_db.close()
+    finally:
+        cleanup = real_session_factory()
+        try:
+            for txn in cleanup.scalars(
+                select(PurchasedProductInventoryTransaction).where(
+                    PurchasedProductInventoryTransaction.product_id == product_id
+                )
+            ):
+                cleanup.delete(txn)
+            row = cleanup.scalar(
+                select(PurchasedProductInventory).where(
+                    PurchasedProductInventory.product_id == product_id
+                )
+            )
+            if row is not None:
+                cleanup.delete(row)
+                cleanup.flush()
+            cleanup.commit()
+        finally:
+            cleanup.close()
+        _cleanup_business_graph(
+            real_session_factory,
+            row_model=Product,
+            row_id=product_id,
             business_id=business_id,
             owner_id=owner_id,
         )
