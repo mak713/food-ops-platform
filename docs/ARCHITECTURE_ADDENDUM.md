@@ -633,3 +633,200 @@ inventory-affecting operation (Initial Balance, Restock, Manual Adjustment) writ
 balance/cost-field mutation and its corresponding transaction row within one atomic database
 transaction, committed together — there is no code path that can persist one without the
 other, whether the operation succeeds or is rejected partway through.
+
+### ADR-117 — Order Aggregate Concurrency: `Order.version` as the Aggregate Boundary, Stable Version-less `OrderLine`s, and `touch_order()`
+
+`Order` joins the `version_id_col` optimistic-concurrency cohort ADR-100 established and
+ADR-104/ADR-113 extended to `Ingredient`/`PurchasedProductInventory` — the identical
+`__mapper_args__ = {"version_id_col": cls.version}` `@declared_attr.directive` wiring, the
+identical client-submitted-`version` pre-check via `check_version` before any write, and the
+identical `commit_or_raise_stale` translation of a within-transaction `StaleDataError` race into
+`409 STALE_VERSION`. `OrderLine` deliberately receives no version column of its own: `Order.version`
+is the single optimistic-concurrency boundary for the *entire mutable Draft aggregate* — header
+fields, every line, and their derived totals together — not a per-line concern. A retained line's
+`id`/`created_at` never change under any edit (stable-ID reconciliation: a submitted line with a
+populated `id` is matched and updated in place; an absent `id` is a new line; a persisted line
+whose `id` is not resubmitted is deleted); only the parent `Order.version` need ever be checked or
+compared, never an individual line's own state.
+
+This creates one implementation gap SQLAlchemy's default behavior doesn't close on its own: a
+Draft edit that changes only a child `OrderLine` row, where the recomputed `subtotal`/`final_total`
+happen to net to the same value as before, leaves every column on the `orders` row itself
+unchanged — so SQLAlchemy's unit-of-work never considers the `Order` instance dirty, never emits
+an `UPDATE orders ...`, and `version` silently fails to advance despite a real mutation having
+occurred. `app/core/tenant.py::touch_order(order)` closes this: `order.updated_at = func.now()`,
+called unconditionally at the end of every Order-aggregate-mutating service function, immediately
+before `commit_or_raise_stale`. Assigning an actual new value (a SQL expression, not the
+already-loaded Python `datetime`) unambiguously dirties the attribute through the ORM's ordinary
+change-tracking path, which is what places `Order` in `Session.dirty` and causes `version_id_col`'s
+unconditional-once-dirty `UPDATE ... SET version = version + 1 WHERE version = :current` to fire —
+this is the same path an ordinarily-changed column already takes for a header-only or
+total-changing edit; `touch_order()` only guarantees the *child-only, net-zero-total* edit takes it
+too. `add_payment` never calls `touch_order()` — inserting a `Payment` is a separate
+historical-child operation, not a mutation of the `Order` aggregate's own state (ADR-120).
+
+Every code path that acquires the parent Order row lock (`get_order_for_business_locked`) and
+then reaches an expected rejection — a stale-version pre-check failure, a non-`DRAFT` mutation
+attempt, an invalid/inactive newly-introduced reference, a Payment-overage warning, a
+Draft-total-reduction-vs-Payments warning, a Draft-delete-has-Payments warning, or a
+reconciliation/representability failure discovered after the lock is held (ADR-119) — rolls back
+explicitly (`except ApiError: db.rollback(); raise`) before raising, so the lock is never left held
+by a transaction the caller didn't explicitly end. Reference locking across the Order's three
+reference types (Customer, Product, Selling Option) follows ADR-106's deterministic
+multi-row/shared-ancestor discipline in one fixed group order — Customer, then Product, then
+Selling Option, IDs sorted within each group — every time a request needs more than one, never
+reversed.
+
+### ADR-118 — Snapshot-Preserving Draft Edits: Independent Per-Dimension Checks and Line-Type Semantics
+
+ADR-029 (spec) establishes that existing Order Lines preserve their seller-agreed price/packaging
+snapshots despite later catalog changes, and ADR-108 establishes the general archived-master-data
+carry-forward rule. Phase 6's implementation of that principle for a *retained* `OrderLine` is four
+independent per-dimension checks, evaluated in a fixed order against only that line's own
+resubmitted fields — never a blanket "refresh from catalog" and never coupled to one another:
+
+1. **Source-identity** — triggers only when the submitted `product_id`/`selling_option_id` (for
+   `STANDARD_OPTION`; `CUSTOM_QUANTITY` has only `product_id`; `CUSTOM_ITEM` has no source-identity
+   dimension at all) genuinely differs from what's stored. Resubmitting the *same* id, even with
+   every other field on the line also resubmitted, is never treated as a source change — this is
+   the "same-source reselection is not a catalog refresh" rule. Only this check ever touches
+   `display_name_snapshot`, the underlying-quantity basis, and the catalog-derived packaging
+   snapshot; if it doesn't fire, nothing else on the line touches those fields either.
+2. **Price-only** — triggers on an explicit submitted price differing from the stored snapshot;
+   touches only the price snapshot (+ `price_override_reason` if supplied) and `line_subtotal`.
+3. **Packaging-only** — meaningful only for `CUSTOM_QUANTITY` (its packaging basis is the one
+   seller-editable, non-catalog-derived dimension); triggers on an explicit submitted packaging
+   override differing from stored.
+4. **Quantity-only** — triggers on a submitted `package_quantity`/`underlying_quantity` differing
+   from stored; recomputes only the quantity-derived fields, using whatever price/packaging basis
+   is already in effect after checks 2–3 in the same pass, never a live catalog re-fetch.
+
+If none of the four fire, the row is not written at all — an unrelated edit (a different line, or
+only Order-header fields) leaves a retained line's snapshot byte-for-byte untouched regardless of
+any live catalog change elsewhere. A retained line's reference may carry forward even if it has
+since been archived (ADR-108), but a *newly introduced* reference — a new line, or an actual source
+change on a retained line — may never target an inactive Customer/Product/Selling Option.
+
+**Line-type interpretation** (ADR-028's spec-level three-type shape, as implemented): `STANDARD_OPTION`
+is Product + Selling Option package semantics — `package_quantity` is the seller-editable
+dimension, `underlying_quantity` is always derived from it. `CUSTOM_QUANTITY` retains Product-level
+automation (a real `product_id`) but `package_quantity` is fixed at `1` always, never seller-edited,
+and `charged_unit_price` is the seller-agreed *whole-line* price rather than a per-package rate.
+`CUSTOM_ITEM` has no Product/Recipe relationship at all — no fabricated automation, `product_id`
+always `NULL`.
+
+`CUSTOM_ITEM.manual_fulfillment_required` defaults to `true` at the application/service layer (a
+Custom Item has no Product/Recipe automation to prove fulfillment against, so the safe default
+requires manual confirmation); the seller may explicitly turn it off. The frozen column itself
+still defaults `false` at the database level — this `true`-for-`CUSTOM_ITEM` default is enforced by
+the service whenever the request field is omitted, not by the schema. `STANDARD_OPTION`/
+`CUSTOM_QUANTITY` unconditionally force this field `false`, ignoring whatever a client submits.
+`manual_fulfillment_satisfied` is always `false` in Phase 6 for every line type and is not accepted
+as request input anywhere — it becomes operationally meaningful only once a later phase's
+Ready-determination logic reads it.
+
+### ADR-119 — Phase 6 Decimal Persistence Convention: `NUMERIC(14,2)` Money and `NUMERIC(18,6)` Quantities
+
+Following the calculation/persistence *pattern* ADR-115 established for Phase 5 — Decimal-only
+arithmetic inside self-contained `decimal.localcontext()`s (ADR-109), unrounded domain calculators,
+exactly one quantization point at the service layer, application-level representability validation
+before persistence — Phase 6 makes its own, independently-chosen quantum/rounding decisions for its
+own two authoritative column shapes, not a reuse of Phase 5's inventory figures:
+
+- Derived customer-facing money persisted to `NUMERIC(14,2)`: `Decimal("0.01")` quantum,
+  `ROUND_HALF_UP`.
+- Derived Order quantities persisted to `NUMERIC(18,6)`: `Decimal("0.000001")` quantum,
+  `ROUND_HALF_UP`. Despite the coincidentally-matching numeric shape, this quantum/rounding pair is
+  declared locally in `app/domain/order_pricing.py`, not imported from
+  `app/domain/inventory_costing.py` — an independent Phase 6 domain decision, not an accidental
+  inheritance from Phase 5's inventory module.
+
+Raw seller-entered values (a typed price, an entered quantity) are validated to their destination
+precision via Pydantic `Field(max_digits=..., decimal_places=...)` and rejected with a clean `422`
+above that precision — never silently rounded. Every *derived* value (a line subtotal, an Order
+subtotal, a `final_total`) is checked for representability at its own destination precision before
+assignment, using the same `is_representable_in_numeric_14_2`/`_18_6` shared-helper pattern ADR-115
+established; a value that would not fit is rejected before any write. `subtotal` and `final_total`
+are checked *independently* of one another — a large negative `order_adjustment` can bring an
+out-of-range `subtotal` back into a representable `final_total`, so checking only the final figure
+would let an unrepresentable subtotal slip through unnoticed; both are validated on their own terms.
+A strictly positive derived quantity that would quantize to `0.000000` at six-decimal storage
+precision is rejected outright, mirroring ADR-115's identical Ingredient-quantity rule.
+
+### ADR-120 — Payment Model: Append-Only Events, Derived Status With Zero-Dollar Precedence, and Lock-Serialized Concurrency
+
+ADR-033 (spec) establishes that Payments are internal positive records with derived status and
+permitted overpayment. Phase 6's implementation: a Payment is an append-only, individually-positive
+record with no edit endpoint and no individual-delete endpoint anywhere — the sole exception is the
+full Draft-deletion cascade, which removes every Payment on that Draft only as part of removing the
+Draft itself, behind its own explicit has-Payments warning/acknowledgment. Payment status is always
+derived at read time from `payments_total` vs. `final_total`, never persisted as its own column.
+`derive_payment_status` checks `payments_total == 0` unconditionally *first*, before any `>=`
+comparison — so a `$0.00` Order with zero recorded Payments is `UNPAID`, never spuriously `PAID`
+merely because `0 >= 0`; a deliberately recorded positive Payment against a `$0.00` Order is
+therefore always an overpayment, subject to the same acknowledgment flow as any other. New Payments
+are rejected (`409`) against a `CANCELED` Order; Payments remain explicitly permitted after
+`COMPLETED` (ADR-034's completion-independent-of-payment rule extends naturally to "and payment can
+continue after completion too"). Inserting a Payment never calls `touch_order()` (ADR-117) — it is
+a separate historical-child write, not a mutation of the Order aggregate's own version-tracked state.
+
+Concurrency: the parent Order row lock (`get_order_for_business_locked`) is the single serialization
+point between a new Payment insertion and a concurrent Draft-total-reducing edit. Both `add_payment`
+and `update_draft_order` query the authoritative `SUM(payments.amount)` directly from the database,
+*after* acquiring that lock — never from a possibly-stale, possibly-pre-loaded `order.payments`
+relationship collection that could have been populated earlier in the same request before the lock
+was taken — so the two operations can never disagree about "the current recorded Payments total"
+they're each protecting against, and a second concurrent Payment always sees the first's already-
+committed sum rather than a stale pre-lock read.
+
+### ADR-121 — Phase 6/7 Confirmation Boundary: Structural Readiness Only, No Persisted `CONFIRMED`
+
+Phase 6 provides no route that ever persists any Order status other than `DRAFT` — `CONFIRMED`,
+`READY`, `COMPLETED`, and `CANCELED` (ADR-026, spec) remain reachable in this phase only through
+direct test-fixture construction for boundary testing, never through any Phase 6 endpoint, and a
+Draft's cascade-delete removes its rows entirely rather than transitioning them. In place of real
+confirmation, `OrderResponse` exposes a typed, pure structural-readiness check — `is_confirmable:
+bool` and `confirmation_issues: list[{severity, code, message, field}]` — covering only status is
+`DRAFT`, at least one `OrderLine` exists, and `fulfillment_date` is present. This check performs no
+database access and never re-validates reference active-state, so a validly carried-forward archived
+reference (ADR-108) can never cause a false rejection. No `confirmed_at` column is written, no
+`DRAFT → CONFIRMED` `OrderStatusHistory` row is ever inserted, and no operational
+projection/reservation/allocation table receives any write from any Phase 6 code path.
+
+This is an especially important cross-phase contract: a persisted `CONFIRMED` Order represents real
+operational demand — it is the trigger for Phase 7's recalculation, reservation, and downstream
+production/shopping-list behavior. Phase 7 must therefore implement the real confirmation action
+(persisting `CONFIRMED`, the status-history row, and its operational recalculation/reservation
+writes) as a single atomic operation, reusing this same structural-readiness check as its first
+validation gate — no code path may ever leave an Order persisted as `CONFIRMED` without its
+corresponding operational projection already committed alongside it, since a partially-confirmed
+Order (confirmed in name but operationally unaccounted-for) would violate the guarantee every later
+phase's reservation/production logic depends on.
+
+Phase 6 implements: Draft create/read/list/edit/delete; Guest/Customer selection, including
+switching between them on an existing Draft; inline Customer creation from Order Entry; all three
+line types (`STANDARD_OPTION`, `CUSTOM_QUANTITY`, `CUSTOM_ITEM`) with their snapshot semantics
+(ADR-118); fulfillment details/notes; a generic Order adjustment and manual tax (ADR-031/ADR-032,
+spec); server-authoritative totals; an optional initial Payment at Draft creation and unlimited
+subsequent Payments; derived Payment status and overpayment acknowledgment (ADR-120);
+Draft-delete-with-Payments acknowledgment; optimistic concurrency and stable `OrderLine` identity
+(ADR-117); archived-reference carry-forward (ADR-108); the typed structural-readiness indicator
+above; Order Details; a single-page Order Entry UI; and a disabled, clearly-labeled Operational
+Impact Preview placeholder. It does not implement: actual confirmation; Cancel/Ready/Complete
+workflows; Ingredient/Purchased-Product reservations; operational recalculation or projections;
+Production Requirements/Runs; Shopping List derivation; operational cost allocation; or any other
+Phase 7+ lifecycle behavior.
+
+### ADR-122 — Order Number Generation: UUID-Derived Token, No Sequence
+
+The seller-facing `order_number` is `f"ORD-{order_id.hex[:12].upper()}"` — derived entirely from the
+Order's own already-globally-unique `id` (assigned client-side via `uuid.uuid4()` before insert).
+There is no `MAX()+1` query, no separate sequence/counter table, and therefore no schema migration
+and no reuse-after-deletion problem. `UNIQUE(business_id, order_number)` remains the database-level
+backstop against the astronomically unlikely case of two Orders in the same Business sharing a
+12-hex-character id prefix. On that constraint violation, the bounded retry (three attempts)
+restarts the *entire* transactional create attempt from scratch — fresh reference locks, fresh
+reads, a fresh `id` — rather than only regenerating the `id`/`order_number` pair while continuing to
+use ORM objects or locks obtained before the failed attempt's rollback: a rollback releases every
+lock the transaction was holding, so continuing to operate on state read under those now-released
+locks would be unsound.

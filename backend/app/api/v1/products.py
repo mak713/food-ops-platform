@@ -73,13 +73,14 @@ def _product_to_response(product: Product) -> ProductResponse:
     )
 
 
-def _product_to_summary(product: Product) -> ProductSummary:
+def _product_to_summary(product: Product, has_active_selling_option: bool) -> ProductSummary:
     return ProductSummary(
         id=str(product.id),
         name=product.name,
         product_type=product.product_type,
         is_active=product.is_active,
         version=product.version,
+        has_active_selling_option=has_active_selling_option,
     )
 
 
@@ -144,7 +145,10 @@ def list_products(
         db, business, q=q, is_active=is_active, limit=limit, offset=offset
     )
     return PageResponse(
-        items=[_product_to_summary(p) for p in items], total=total, limit=limit, offset=offset
+        items=[_product_to_summary(p, has_option) for p, has_option in items],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 

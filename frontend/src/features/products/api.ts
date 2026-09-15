@@ -39,6 +39,12 @@ export interface ProductSummary {
   product_type: ProductType;
   is_active: boolean;
   version: number;
+  // Whether this Product currently has at least one active Selling Option — a
+  // narrowly-scoped, read-only backend addition (Manual Acceptance Pricing/UX
+  // Correction §1) computed via a single correlated-subquery list query, not an N+1
+  // per-Product fetch. Used to keep a STANDARD_OPTION line's Product picker from
+  // ever newly offering a Product that can't actually form a valid line.
+  has_active_selling_option: boolean;
 }
 
 export interface ProductCreateRequest {

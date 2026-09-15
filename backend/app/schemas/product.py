@@ -174,3 +174,11 @@ class ProductSummary(BaseModel):
     product_type: ProductType
     is_active: bool
     version: int
+    # Manual Acceptance Pricing/UX Correction §1 — a narrowly-scoped read-side addition,
+    # not a new domain concept: derived at query time from the already-owned
+    # SellingOption.is_active data via one correlated-subquery list query (see
+    # `list_products_for_business`), never an N+1 per-Product fetch. Exists so the
+    # Order Entry STANDARD_OPTION Product picker can exclude a Product with zero active
+    # Selling Options from *new* selection without fetching every candidate Product's
+    # full detail first.
+    has_active_selling_option: bool

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from app.db.enums import OrderLineType
 from app.db.models.product import Product
-from tests.integration.api.helpers import csrf_headers, signup
+from tests.integration.api.helpers import ORIGIN_HEADERS, csrf_headers, signup
 from tests.integration.schema.factories import make_order, make_order_line, make_recipe
 
 
@@ -116,6 +116,183 @@ def test_list_and_get_products(client):
     product_id = listing.json()["items"][0]["id"]
     detail = client.get(f"/api/v1/products/{product_id}")
     assert detail.status_code == 200
+
+
+def test_list_products_has_active_selling_option_flag(client):
+    """Manual Acceptance Pricing/UX Correction §1 — the list endpoint's
+    `has_active_selling_option` flag lets the Order Entry Standard Option picker exclude
+    a Product with zero active Selling Options from *new* selection without an N+1 fetch
+    per Product. Covers all three cases: no Selling Options at all, only an archived one,
+    and at least one active one."""
+    signup(client)
+    client.post(
+        "/api/v1/products",
+        json={"name": "No Options", "product_type": "PRODUCED"},
+        headers=csrf_headers(client),
+    )
+    only_archived = client.post(
+        "/api/v1/products",
+        json={"name": "Only Archived", "product_type": "PRODUCED"},
+        headers=csrf_headers(client),
+    ).json()
+    with_active = client.post(
+        "/api/v1/products",
+        json={"name": "With Active", "product_type": "PRODUCED"},
+        headers=csrf_headers(client),
+    ).json()
+
+    archived_option = client.post(
+        f"/api/v1/products/{only_archived['id']}/selling-options",
+        json={"name": "Old Option", "quantity_units": 1, "price": 1},
+        headers=csrf_headers(client),
+    ).json()
+    client.post(
+        f"/api/v1/products/{only_archived['id']}/selling-options/{archived_option['id']}/archive",
+        json={"version": archived_option["version"]},
+        headers=csrf_headers(client),
+    )
+    client.post(
+        f"/api/v1/products/{with_active['id']}/selling-options",
+        json={"name": "Six Pack", "quantity_units": 6, "price": 12},
+        headers=csrf_headers(client),
+    )
+
+    listing = client.get("/api/v1/products").json()
+    flags_by_name = {p["name"]: p["has_active_selling_option"] for p in listing["items"]}
+    assert flags_by_name["No Options"] is False
+    assert flags_by_name["Only Archived"] is False
+    assert flags_by_name["With Active"] is True
+
+
+def test_list_products_eligibility_tenant_isolated_paginated_and_no_n_plus_one(client, session):
+    """STANDARD_OPTION End-to-End Fix §9 — a second, real-database integration test for
+    `has_active_selling_option` (not a replacement for the one above) that additionally
+    proves: the flag and the listing itself stay correctly tenant-scoped; pagination
+    still works against the tuple-returning `list_products_for_business`; and computing
+    the flag for every Product in one list call issues the same number of SQL statements
+    regardless of how many Products exist — never one extra query per Product (no N+1).
+    """
+    tenant_a_email = "tenant-a-eligibility@example.com"
+    tenant_a_password = "tenant a correct horse battery"
+    signup(client, email=tenant_a_email, password=tenant_a_password)
+
+    product_a = client.post(
+        "/api/v1/products",
+        json={"name": "Eligible A", "product_type": "PRODUCED"},
+        headers=csrf_headers(client),
+    ).json()
+    client.post(
+        f"/api/v1/products/{product_a['id']}/selling-options",
+        json={"name": "Option", "quantity_units": 1, "price": 5},
+        headers=csrf_headers(client),
+    )
+    client.post(
+        "/api/v1/products",
+        json={"name": "No Options B", "product_type": "PRODUCED"},
+        headers=csrf_headers(client),
+    )
+    product_c = client.post(
+        "/api/v1/products",
+        json={"name": "Only Inactive C", "product_type": "PRODUCED"},
+        headers=csrf_headers(client),
+    ).json()
+    inactive_option = client.post(
+        f"/api/v1/products/{product_c['id']}/selling-options",
+        json={"name": "Old", "quantity_units": 1, "price": 1},
+        headers=csrf_headers(client),
+    ).json()
+    client.post(
+        f"/api/v1/products/{product_c['id']}/selling-options/{inactive_option['id']}/archive",
+        json={"version": inactive_option["version"]},
+        headers=csrf_headers(client),
+    )
+
+    # Pagination still works against the (Product, bool) tuple-returning list function:
+    # two pages together cover exactly the three Products created above, no overlap/gap.
+    page1 = client.get("/api/v1/products?limit=2&offset=0").json()
+    page2 = client.get("/api/v1/products?limit=2&offset=2").json()
+    assert page1["total"] == 3
+    assert len(page1["items"]) == 2
+    assert len(page2["items"]) == 1
+    names_seen = {p["name"] for p in page1["items"]} | {p["name"] for p in page2["items"]}
+    assert names_seen == {"Eligible A", "No Options B", "Only Inactive C"}
+
+    def _count_sql_statements(url: str) -> tuple[int, dict]:
+        count = 0
+
+        def _tick(*_args, **_kwargs):
+            nonlocal count
+            count += 1
+
+        connection = session.connection()
+        event.listen(connection, "before_cursor_execute", _tick)
+        try:
+            body = client.get(url).json()
+        finally:
+            event.remove(connection, "before_cursor_execute", _tick)
+        return count, body
+
+    # Baseline: one list call against 3 Products.
+    count_with_3, listing_with_3 = _count_sql_statements("/api/v1/products?limit=200")
+    assert listing_with_3["total"] == 3
+    flags_by_name = {p["name"]: p["has_active_selling_option"] for p in listing_with_3["items"]}
+    assert flags_by_name["Eligible A"] is True
+    assert flags_by_name["No Options B"] is False
+    assert flags_by_name["Only Inactive C"] is False
+
+    # Add 3 more (eligible) Products and issue the identical list call again — an N+1
+    # implementation would issue 3 additional per-Product queries here; the actual
+    # correlated-EXISTS implementation issues exactly the same number of statements
+    # regardless of how many Products are being listed.
+    for name in ("Eligible D", "Eligible E", "Eligible F"):
+        extra = client.post(
+            "/api/v1/products",
+            json={"name": name, "product_type": "PRODUCED"},
+            headers=csrf_headers(client),
+        ).json()
+        client.post(
+            f"/api/v1/products/{extra['id']}/selling-options",
+            json={"name": "Option", "quantity_units": 1, "price": 5},
+            headers=csrf_headers(client),
+        )
+    count_with_6, listing_with_6 = _count_sql_statements("/api/v1/products?limit=200")
+    assert listing_with_6["total"] == 6
+    assert count_with_6 == count_with_3, (
+        "SQL statement count for the Product list scaled with the number of Products "
+        f"({count_with_3} -> {count_with_6}) — this is the N+1 signature the "
+        "correlated-EXISTS design is supposed to avoid."
+    )
+
+    # Tenant isolation: a second business's identically-named, independently-eligible
+    # Product must never appear in tenant A's own listing, and tenant B's own listing
+    # must never see any of tenant A's Products either.
+    signup(
+        client, email="tenant-b-eligibility@example.com", password="tenant b correct horse battery"
+    )
+    client.post(
+        "/api/v1/products",
+        json={"name": "Eligible A", "product_type": "PRODUCED"},
+        headers=csrf_headers(client),
+    )
+    tenant_b_listing = client.get("/api/v1/products").json()
+    assert tenant_b_listing["total"] == 1
+    assert tenant_b_listing["items"][0]["has_active_selling_option"] is False
+
+    client.post(
+        "/api/v1/auth/login",
+        json={"email": tenant_a_email, "password": tenant_a_password},
+        headers=ORIGIN_HEADERS,
+    )
+    tenant_a_listing_again = client.get("/api/v1/products").json()
+    assert tenant_a_listing_again["total"] == 6
+    assert {p["name"] for p in tenant_a_listing_again["items"]} == {
+        "Eligible A",
+        "No Options B",
+        "Only Inactive C",
+        "Eligible D",
+        "Eligible E",
+        "Eligible F",
+    }
 
 
 def test_archive_and_reactivate_product_is_idempotent(client):

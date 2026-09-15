@@ -19,7 +19,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, declared_attr, mapped_column, relationship
 
 from app.db.base import Base
 from app.db.columns import MONEY, QUANTITY, RATIO
@@ -51,6 +51,16 @@ class Order(Base, TimestampMixin, VersionMixin):
         Index("ix_orders_business_id_fulfillment_date", "business_id", "fulfillment_date"),
         Index("ix_orders_business_id_completed_at", "business_id", "completed_at"),
     )
+
+    # Optimistic concurrency (Spec §8.33 explicitly names Order; Phase 6 Final Plan §D.1) —
+    # applied per-class, matching the Customer/Product/SellingOption/Ingredient precedent
+    # exactly. The `version` column itself already existed (VersionMixin, Phase 1) but was
+    # never wired into `__mapper_args__` until now — this is a pure ORM-mapper change, no
+    # migration (identical situation to `Ingredient`'s own wiring in Phase 4, see
+    # app/db/models/ingredient.py).
+    @declared_attr.directive
+    def __mapper_args__(cls) -> dict:
+        return {"version_id_col": cls.version}
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     business_id: Mapped[uuid.UUID] = mapped_column(
@@ -89,14 +99,29 @@ class Order(Base, TimestampMixin, VersionMixin):
 
     business: Mapped[Business] = relationship()
     customer: Mapped[Customer | None] = relationship()
+    # Explicit, deterministic ordering (Phase 6 Final Plan §H/§I — same class of
+    # remediation as `Product.selling_options`'s own `order_by`): without it, Postgres
+    # makes no ordering guarantee for a plain SELECT, so the embedded lists on
+    # OrderResponse could render in a different order per request. `id` is the
+    # deterministic tiebreaker for rows sharing a timestamp. Pure ORM-level relationship
+    # config — no schema/migration change.
     lines: Mapped[list[OrderLine]] = relationship(
-        back_populates="order", cascade="all, delete-orphan", passive_deletes=True
+        back_populates="order",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="OrderLine.created_at, OrderLine.id",
     )
     payments: Mapped[list[Payment]] = relationship(
-        back_populates="order", cascade="all, delete-orphan", passive_deletes=True
+        back_populates="order",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="Payment.payment_date, Payment.created_at, Payment.id",
     )
     status_history: Mapped[list[OrderStatusHistory]] = relationship(
-        back_populates="order", cascade="all, delete-orphan", passive_deletes=True
+        back_populates="order",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="OrderStatusHistory.changed_at, OrderStatusHistory.id",
     )
 
 

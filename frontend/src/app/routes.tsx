@@ -22,6 +22,9 @@ import { IngredientListPage } from "../features/ingredients/IngredientListPage";
 import { IngredientReplacementCostPage } from "../features/ingredients/IngredientReplacementCostPage";
 import { IngredientRestockPage } from "../features/ingredients/IngredientRestockPage";
 import { InventoryHistoryPage } from "../features/inventory/InventoryHistoryPage";
+import { OrderDetailPage } from "../features/orders/OrderDetailPage";
+import { OrderEntryPage } from "../features/orders/OrderEntryPage";
+import { OrderListPage } from "../features/orders/OrderListPage";
 import { InventoryHubPage } from "../features/inventory/InventoryHubPage";
 import { PurchasedAdjustPage } from "../features/inventory/PurchasedAdjustPage";
 import { PurchasedInitialBalancePage } from "../features/inventory/PurchasedInitialBalancePage";
@@ -68,6 +71,9 @@ function AppLayout() {
           </Link>
           <Link to="/app/products" className="text-muted-foreground hover:text-foreground">
             Products
+          </Link>
+          <Link to="/app/orders" className="text-muted-foreground hover:text-foreground">
+            Orders
           </Link>
           <Link to="/app/inventory" className="text-muted-foreground hover:text-foreground">
             Inventory
@@ -185,6 +191,10 @@ export const routes: RouteObject[] = [
             element: <PurchasedInventoryHistoryPage />,
           },
           { path: "inventory/history", element: <InventoryHistoryPage /> },
+          { path: "orders", element: <OrderListPage /> },
+          { path: "orders/new", element: <OrderEntryPage /> },
+          { path: "orders/:id", element: <OrderDetailPage /> },
+          { path: "orders/:id/edit", element: <OrderEntryPage /> },
         ],
       },
     ],

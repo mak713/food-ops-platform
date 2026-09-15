@@ -10,6 +10,7 @@ from app.api.v1.auth import router as auth_router
 from app.api.v1.customers import router as customers_router
 from app.api.v1.ingredient_inventory import router as ingredient_inventory_router
 from app.api.v1.ingredients import router as ingredients_router
+from app.api.v1.orders import router as orders_router
 from app.api.v1.products import router as products_router
 from app.api.v1.purchased_inventory import list_router as purchased_inventory_list_router
 from app.api.v1.purchased_inventory import router as purchased_inventory_router
@@ -46,6 +47,7 @@ app.include_router(
     ingredient_inventory_router, prefix="/api/v1/ingredients", tags=["ingredient-inventory"]
 )
 app.include_router(products_router, prefix="/api/v1/products", tags=["products"])
+app.include_router(orders_router, prefix="/api/v1/orders", tags=["orders"])
 app.include_router(
     purchased_inventory_router, prefix="/api/v1/products", tags=["purchased-inventory"]
 )

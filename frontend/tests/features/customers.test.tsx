@@ -2,7 +2,7 @@
 // (fetch mocking, full router render via createMemoryRouter).
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { routes } from "../../src/app/routes";
@@ -332,8 +332,13 @@ describe("Customer detail", () => {
     renderAt("/app/customers/c1");
     await screen.findByRole("heading", { name: "Ada Lovelace" });
 
-    // No Order/history section rendered at all (Phase 3 plan v3 §13).
-    expect(screen.queryByText(/order/i)).not.toBeInTheDocument();
+    // No Order/history section rendered at all (Phase 3 plan v3 §13). Scoped to the
+    // page's own <main> content, not the app-shell nav — Phase 6 legitimately added a
+    // global "Orders" nav link (present on every page), which is unrelated to whether
+    // this page's own content renders an order-history section.
+    const main = document.querySelector("main");
+    expect(main).not.toBeNull();
+    expect(within(main as HTMLElement).queryByText(/order/i)).not.toBeInTheDocument();
   });
 
   it("renders a 'not found' state for a 404, identical for missing vs foreign-tenant", async () => {

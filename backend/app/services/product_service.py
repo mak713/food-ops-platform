@@ -93,7 +93,12 @@ def list_products_for_business(
     is_active: bool | None = None,
     limit: int = 50,
     offset: int = 0,
-) -> tuple[list[Product], int]:
+) -> tuple[list[tuple[Product, bool]], int]:
+    """Returns `(Product, has_active_selling_option)` pairs, not bare `Product` rows
+    (Manual Acceptance Pricing/UX Correction §1). The eligibility flag is computed via a
+    single correlated `EXISTS` subquery folded into this same list query — one query
+    total for the whole page, never a per-Product follow-up fetch (no N+1 across the
+    Product list, regardless of page size)."""
     conditions = [Product.business_id == business.id]
     if q:
         conditions.append(Product.name.ilike(f"%{q}%"))
@@ -101,15 +106,20 @@ def list_products_for_business(
         conditions.append(Product.is_active == is_active)
 
     total = db.scalar(select(func.count()).select_from(Product).where(*conditions)) or 0
-    items = list(
-        db.scalars(
-            select(Product)
-            .where(*conditions)
-            .order_by(Product.name.asc())
-            .limit(limit)
-            .offset(offset)
-        )
+    has_active_selling_option = (
+        select(SellingOption.id)
+        .where(SellingOption.product_id == Product.id, SellingOption.is_active.is_(True))
+        .correlate(Product)
+        .exists()
     )
+    rows = db.execute(
+        select(Product, has_active_selling_option)
+        .where(*conditions)
+        .order_by(Product.name.asc())
+        .limit(limit)
+        .offset(offset)
+    )
+    items = [(row[0], row[1]) for row in rows]
     return items, total
 
 
