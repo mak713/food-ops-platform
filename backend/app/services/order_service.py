@@ -162,6 +162,8 @@ def _validate_and_lock_order_references(
     existing_customer_id: uuid.UUID | None,
     lines: list[OrderLineInput],
     existing_lines_by_id: dict[uuid.UUID, OrderLine],
+    additional_product_ids: frozenset[uuid.UUID] = frozenset(),
+    lock: bool = True,
 ) -> tuple[Customer | None, dict[uuid.UUID, Product], dict[uuid.UUID, SellingOption]]:
     """Validates+locks every NEWLY INTRODUCED reference — the Order-header `customer_id`
     (only if it differs from `existing_customer_id`) and each line's `product_id`/
@@ -172,18 +174,38 @@ def _validate_and_lock_order_references(
     Collects every invalid/inactive/wrong-product reference into one 422 (never stops at
     the first) — the non-disclosing shape already established for body-embedded
     references (ADR-107): missing, foreign-tenant, and (for a Selling Option) belonging to
-    a different Product than declared are all indistinguishable "not found" outcomes."""
+    a different Product than declared are all indistinguishable "not found" outcomes.
+
+    `additional_product_ids` (Phase 7 Implementation Remediation Plan, Finding 1; Final
+    Architecture Lock §B) — every Product whose operational closure a Phase 7 confirmed
+    edit will recalculate, a SUPERSET of whatever this function's own reference-diff
+    logic would lock on its own (a quantity-only edit to an unchanged line reference
+    still needs that Product locked before recalculating, even though the reference
+    itself never changed). Folded into the SAME sorted Product lock query below — never
+    a second, later lock pass. An id present only because of this parameter is locked
+    for serialization ONLY; it is never subjected to the active-state
+    (PRODUCT_NOT_FOUND/PRODUCT_NOT_ACTIVE) rejection below, which applies only to the
+    genuinely newly-selected reference subset (ADR-108 carried-forward semantics).
+
+    `lock` (Phase 7 Final Semantic & Precision Correction Plan, Finding 6) — real
+    Create/Edit workflows never pass this (default `True`, unchanged locking
+    behavior). Preview's own read-only, zero-write call passes `lock=False` so its
+    reference resolution acquires no PostgreSQL row locks at all, since it always
+    rolls back immediately after — every other validation rule (tenant scoping,
+    active/new-reference checks, SellingOption/Product consistency) is identical
+    code either way, reused rather than duplicated."""
     issues: list[dict] = []
 
     # --- Group 1: Customer (header-level, at most one row) ---
     customer: Customer | None = None
     customer_changed = customer_id != existing_customer_id
     if customer_changed and customer_id is not None:
-        customer = db.scalar(
-            select(Customer)
-            .where(Customer.id == customer_id, Customer.business_id == business.id)
-            .with_for_update()
+        customer_query = select(Customer).where(
+            Customer.id == customer_id, Customer.business_id == business.id
         )
+        if lock:
+            customer_query = customer_query.with_for_update()
+        customer = db.scalar(customer_query)
         if customer is None:
             issues.append(
                 _ref_issue(
@@ -229,15 +251,20 @@ def _validate_and_lock_order_references(
         elif line.product_id is not None and product_changed:
             product_ids.add(line.product_id)
 
-    # --- Group 2: Product ---
+    # --- Group 2: Product (Final Architecture Lock §B: reference-newly-changed ids
+    # UNION Phase 7's operationally-affected superset, locked in ONE query — never a
+    # reference-lock pass followed later by a separate operational-lock pass) ---
     products: dict[uuid.UUID, Product] = {}
-    if product_ids:
-        rows = db.scalars(
+    all_product_ids = product_ids | additional_product_ids
+    if all_product_ids:
+        product_query = (
             select(Product)
-            .where(Product.id.in_(sorted(product_ids)), Product.business_id == business.id)
+            .where(Product.id.in_(sorted(all_product_ids)), Product.business_id == business.id)
             .order_by(Product.id)
-            .with_for_update()
-        ).all()
+        )
+        if lock:
+            product_query = product_query.with_for_update()
+        rows = db.scalars(product_query).all()
         products = {row.id: row for row in rows}
 
     # --- Group 3: Selling Option (locked by its own id — a single Order may contain
@@ -246,15 +273,17 @@ def _validate_and_lock_order_references(
     # below, in Python, against the already-locked row) ---
     selling_options: dict[uuid.UUID, SellingOption] = {}
     if selling_option_ids:
-        rows = db.scalars(
+        option_query = (
             select(SellingOption)
             .where(
                 SellingOption.id.in_(sorted(selling_option_ids)),
                 SellingOption.business_id == business.id,
             )
             .order_by(SellingOption.id)
-            .with_for_update()
-        ).all()
+        )
+        if lock:
+            option_query = option_query.with_for_update()
+        rows = db.scalars(option_query).all()
         selling_options = {row.id: row for row in rows}
 
     # --- Per-line validation against the now-locked rows ---
@@ -774,32 +803,48 @@ def create_draft_order(db: Session, business: Business, payload: OrderCreateRequ
     raise last_exc or RuntimeError("create_draft_order: exhausted retry attempts")
 
 
-def update_draft_order(
-    db: Session, business: Business, order_id: uuid.UUID, payload: OrderUpdateRequest
-) -> Order:
-    """Stable-ID line reconciliation under the parent Order's version + row lock (Final
-    Plan §D.1/§D.2). Every locked-then-rejected path below rolls back before raising
-    (Amendment §2) so the row lock is never held past an expected rejection."""
-    order = get_order_for_business_locked(db, order_id, business)
-    try:
-        check_version(order, payload.version, resource="order")
-    except ApiError:
-        db.rollback()
-        raise
+def _prepare_order_edit(
+    db: Session,
+    business: Business,
+    order: Order,
+    payload: OrderUpdateRequest,
+    *,
+    additional_product_ids: frozenset[uuid.UUID] = frozenset(),
+) -> tuple[
+    dict[uuid.UUID, Product],
+    dict[uuid.UUID, SellingOption],
+    dict[uuid.UUID, OrderLine],
+    set[uuid.UUID],
+    Decimal,
+]:
+    """Phase A of the shared, non-committing full-reconciliation core (Phase 7 Final
+    Remediation Correction Plan, Finding 1) — validate/lock ONLY. No Order/OrderLine
+    ORM mutation happens anywhere in this function; a caller that needs to interleave
+    further lock acquisition (Recipe/Ingredient/Surplus, for a Phase 7 confirmed edit)
+    between reference-locking and mutation can now do so by construction, rather than
+    relying on the session's `autoflush=False` setting to accidentally prevent the old
+    combined function's mutation from reaching PostgreSQL too early.
 
-    if order.status is not OrderStatus.DRAFT:
-        db.rollback()
-        raise ApiError(409, "ORDER_NOT_DRAFT", "Only a Draft order can be edited.")
+    The caller has already locked the Order row and checked its version; this
+    function does NOT commit and does NOT check/enforce `order.status`. Every
+    locked-then-rejected path below rolls back before raising (Amendment §2) so no
+    lock is held past an expected rejection.
 
+    Returns `(products, selling_options, existing_lines_by_id, submitted_ids,
+    payments_total)` — everything Phase B (`_apply_order_edit_body`) needs to
+    reconcile and mutate, plus the full locked-Product dict (newly-referenced ids
+    UNION `additional_product_ids`) so a Phase 7 caller can continue the composed
+    lock chain and recalculate every operationally-affected Product's closure
+    without a second Product lock pass (Final Architecture Lock §B)."""
     # Fresh Payment sum, queried while holding the Order row lock, BEFORE any Order/
     # OrderLine mutation begins (Final Plan §G; Amendment §7) — deliberately sequenced
     # here rather than immediately before its point of use: once header/line mutations
-    # start below, this same query would trigger SQLAlchemy's autoflush (flushing the
-    # not-yet-fully-computed pending changes early, as a separate UPDATE, and bumping
-    # `Order.version` prematurely — then `touch_order`'s later, deliberate UPDATE would
-    # bump it a second time for the same logical edit). Querying it now, while nothing is
-    # yet dirty, avoids that entirely while still satisfying "fresh, post-lock, direct
-    # aggregate query, never a pre-loaded relationship."
+    # start in Phase B, this same query would trigger SQLAlchemy's autoflush (flushing
+    # the not-yet-fully-computed pending changes early, as a separate UPDATE, and
+    # bumping `Order.version` prematurely — then `touch_order`'s later, deliberate
+    # UPDATE would bump it a second time for the same logical edit). Querying it now,
+    # while nothing is yet dirty, avoids that entirely while still satisfying "fresh,
+    # post-lock, direct aggregate query, never a pre-loaded relationship."
     payments_total = db.scalar(
         select(func.coalesce(func.sum(Payment.amount), 0)).where(Payment.order_id == order.id)
     )
@@ -878,14 +923,34 @@ def update_draft_order(
             existing_customer_id=order.customer_id,
             lines=payload.lines,
             existing_lines_by_id=existing_lines_by_id,
+            additional_product_ids=additional_product_ids,
         )
     except ApiError:
         db.rollback()
         raise
 
+    return products, selling_options, existing_lines_by_id, submitted_ids, payments_total
+
+
+def _apply_order_edit_body(
+    db: Session,
+    business: Business,
+    order: Order,
+    payload: OrderUpdateRequest,
+    *,
+    products: dict[uuid.UUID, Product],
+    selling_options: dict[uuid.UUID, SellingOption],
+    existing_lines_by_id: dict[uuid.UUID, OrderLine],
+    submitted_ids: set[uuid.UUID],
+    payments_total: Decimal,
+) -> None:
+    """Phase B of the shared, non-committing full-reconciliation core (Phase 7 Final
+    Remediation Correction Plan, Finding 1) — reconcile/mutate ONLY, given Phase A's
+    (`_prepare_order_edit`) already-locked/validated reference data. Every locked-
+    then-rejected path below rolls back before raising (Amendment §2)."""
     # Every domain/calculator ApiError raised past this point (line reconciliation,
     # snapshot representability) happens after the Order row lock and the reference locks
-    # above were already acquired — roll back before propagating (Checkpoint-3
+    # already acquired in Phase A — roll back before propagating (Checkpoint-3
     # correction: locked rejections must be universally rolled back).
     try:
         for line_id, existing_line in list(existing_lines_by_id.items()):
@@ -951,6 +1016,61 @@ def update_draft_order(
 
     order.subtotal = new_subtotal
     order.final_total = new_final_total
+
+
+def _apply_order_edit(
+    db: Session,
+    business: Business,
+    order: Order,
+    payload: OrderUpdateRequest,
+    *,
+    additional_product_ids: frozenset[uuid.UUID] = frozenset(),
+) -> dict[uuid.UUID, Product]:
+    """Back-to-back Phase A (`_prepare_order_edit`) + Phase B
+    (`_apply_order_edit_body`) — net-identical observable behavior to the original
+    combined function, preserved for `update_draft_order` (a DRAFT edit needs no
+    operational lock interleaved between validation and mutation). A Phase 7
+    confirmed edit instead calls the two phases directly from
+    `order_lifecycle_service.update_confirmed_order`, acquiring Recipe/Ingredient/
+    Surplus locks between them (Final Architecture Lock §A/§B)."""
+    products, selling_options, existing_lines_by_id, submitted_ids, payments_total = (
+        _prepare_order_edit(
+            db, business, order, payload, additional_product_ids=additional_product_ids
+        )
+    )
+    _apply_order_edit_body(
+        db,
+        business,
+        order,
+        payload,
+        products=products,
+        selling_options=selling_options,
+        existing_lines_by_id=existing_lines_by_id,
+        submitted_ids=submitted_ids,
+        payments_total=payments_total,
+    )
+    return products
+
+
+def update_draft_order(
+    db: Session, business: Business, order_id: uuid.UUID, payload: OrderUpdateRequest
+) -> Order:
+    """Thin, DRAFT-only wrapper around `_apply_order_edit` (Phase 7 Implementation
+    Remediation Plan, Finding 1) — observable behavior unchanged from before the
+    extraction: lock -> version check -> status check -> full reconciliation ->
+    touch_order -> single commit."""
+    order = get_order_for_business_locked(db, order_id, business)
+    try:
+        check_version(order, payload.version, resource="order")
+    except ApiError:
+        db.rollback()
+        raise
+
+    if order.status is not OrderStatus.DRAFT:
+        db.rollback()
+        raise ApiError(409, "ORDER_NOT_DRAFT", "Only a Draft order can be edited.")
+
+    _apply_order_edit(db, business, order, payload)
 
     touch_order(order)
     commit_or_raise_stale(db, resource="order")

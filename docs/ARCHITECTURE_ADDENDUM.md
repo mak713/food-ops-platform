@@ -440,6 +440,19 @@ have set. Later phases' own domain calculators (demand aggregation, surplus allo
 costing, etc.) are expected to live under this same package and meet this same
 self-contained-context bar, not just the "pure function, no I/O" half of it.
 
+**Phase 7 addition — domain/application layering for representability failures:** the pure
+`app/domain/` layer never imports or raises `ApiError` or any other application/HTTP exception
+type, even for a representability/overflow condition (e.g. a derived quantity that would not
+fit `NUMERIC(18,6)`, or an `INTEGER` batch/minute count out of int32 range). A pure calculator
+only returns a value or a plain, non-raising validation result — detecting that a value doesn't
+fit is itself just a boolean/value-returning function, not an error-raising one. Translating a
+representability failure into a structured API error, and owning any resulting rollback, is
+exclusively a service-layer responsibility (`operational_recalculation_service.py`'s
+`_persist_numeric_18_6`/`_persist_int32`/`_persist_suggested_start` helpers), matching the
+established pattern `order_service._snapshot_to_columns` already uses. This keeps the "no HTTP
+or database access" boundary this ADR already establishes from being quietly narrowed to "no
+HTTP access, but domain code may still raise HTTP-shaped errors."
+
 ### ADR-110 — Initial Balance: One-Time Physical/Cost-Basis Seeding, Not a Purchase Event
 
 "Initial Balance" (Ingredient and Purchased Product Inventory) represents inventory that
@@ -619,6 +632,26 @@ independently-valid stored values. Distinctly, a strictly positive converted Ing
 quantity that would quantize to `0.000000` at six-decimal storage precision is rejected
 outright rather than silently recording a zero-quantity inventory event — a positive physical
 action must never appear in the ledger or the balance as if nothing happened.
+
+**Phase 7 addition:** Phase 7's own `NUMERIC(18,6)` operational columns (`production_requirements`,
+`production_ingredient_requirements`, etc.) follow this identical convention unchanged —
+calculators remain unrounded; the service layer quantizes exactly once, `ROUND_HALF_UP`;
+representability is validated before the value is ever assigned to an ORM column. The
+positive-value-collapsing-to-zero rejection above is a **field-scoped** rule, not a blanket one:
+it applies only to destination fields whose invariant requires a strictly positive persisted
+value (`> 0`) — e.g. `required_quantity_canonical`, which can never legitimately be zero once a
+batch is actually being produced. A `NUMERIC` field where zero is itself a legitimate, meaningful
+persisted value (e.g. a computed shortage of exactly `0`) is unaffected and continues to allow
+it. Phase 7 also introduces one new sibling primitive alongside this Decimal convention: an
+analogous `INTEGER` representability guard for its new integer batch/minute columns
+(`recommended_batches`, `estimated_active_minutes`, `estimated_elapsed_minutes`) — an
+out-of-int32-range value is rejected the same way, before any database write, never left to a
+raw column-level overflow. `suggested_start_at` gets a related but distinct guard: a genuine
+`datetime` arithmetic `OverflowError`, with every timing input present and individually valid, is
+treated as a data-integrity anomaly and rejected with the same structured error family — this is
+different from, and must never be confused with, the separate non-error case where a timing
+input (fulfillment time or elapsed duration) is simply missing, which yields
+`suggested_start_at = NULL` with no rejection at all.
 
 ### ADR-116 — Inventory Current State and Historical Ledger Commit Atomically; the Ledger Is Immutable and Never Summed to Reconstruct Current State
 
@@ -830,3 +863,294 @@ reads, a fresh `id` — rather than only regenerating the `id`/`order_number` pa
 use ORM objects or locks obtained before the failed attempt's rollback: a rollback releases every
 lock the transaction was holding, so continuing to operate on state read under those now-released
 locks would be unsound.
+
+### ADR-123 — Phase 7 Operational Recalculation Closure and Atomic Lifecycle Transaction Boundary
+
+`recalculate_product_closure` (Spec §11.4) re-derives a Product's entire operational projection —
+`ProductionRequirement`/`-Order`/`ProductionIngredientRequirement`/`IngredientReservation`/
+`SurplusAllocation` — from every applicable *active* `CONFIRMED` `OrderLine` referencing that
+Product, at any `demand_date`, past or future; there is no "today forward" filter, so an overdue
+Order's demand is recalculated exactly like any other. The closure is deliberately Product-scoped:
+recalculating one Product never rewrites another Product's own requirement rows. Cross-Product
+interaction exists only through shared state a Recipe's ingredients happen to draw from — two
+Products' confirmed demand can compete for the same Ingredient's physical stock through their
+independently-owned `IngredientReservation` rows (ADR-126 below) — never through any direct
+Product-to-Product read or write. Reconciliation is a full replace/rebuild of every rebuildable row
+for that Product on each pass, never an incremental patch or an additively-duplicated row, matching
+PLAN-010's "replace/reconcile ... rather than duplicate."
+
+This closure is never computed standalone: Confirm, Cancel, a demand-affecting `CONFIRMED` edit, and
+Recipe/first-Recipe migration each compose it into their own single atomic transaction. A lifecycle
+mutation the recalculation must see (a just-set `CONFIRMED` status, a just-inserted `RecipeRevision`)
+is made visible via an explicit `db.flush()` — never an intermediate `db.commit()` — before the
+closure reads it; the transaction's real commit happens exactly once, after both the mutation and
+its recalculation have succeeded. A rejected warning-acknowledgment set or any recalculation failure
+rolls back the *entire* triggering operation, including the lifecycle mutation that was already
+flushed — there is no code path that leaves a persisted `CONFIRMED`/`CANCELED` status, or a written
+`OrderStatusHistory` row, without its corresponding operational projection change committed
+alongside it in the same transaction, fulfilling the guarantee ADR-121 anticipated.
+
+A persisted `CONFIRMED` Order must always remain structurally confirmable: a proposed `CONFIRMED`
+edit's candidate state must retain at least one valid Order line and a non-null fulfillment date, and
+this structural check runs *before* the production-lock/protected-demand check (ADR-126) — a
+fundamentally invalid candidate is reported as non-confirmable, never masked behind an operational
+lock conflict it never actually reached. Draft editing remains intentionally looser, unaffected by
+this rule. Preview shares the same lifecycle boundary at read time: it is available for a `DRAFT` or
+`CONFIRMED` Order only; a `CANCELED`, `READY`, or `COMPLETED` Order is rejected outright as
+non-previewable, since Preview is an editable-order simulation, not a general-purpose read — this is
+solely a Phase 7 Preview guard and does not imply `READY`/`COMPLETED` behavior itself is implemented
+(both remain out of scope, ADR-121).
+
+Two line types participate in this closure on their own terms, never through a borrowed or fabricated
+representation of the other. A Custom Item line contributes only transient, clearly-labeled
+manual/custom workload guidance computed from its own `custom_active_time_minutes` — no `Product`, no
+`Recipe`, no `ProductionRequirement`, and no `IngredientReservation` is ever fabricated for one
+(ORD-009/010); the resulting minutes figure is operational guidance for the seller, never disguised
+as a produced-goods projection. A Purchased Product's demand is tracked through its own
+`PurchasedProductReservation`/shortage path rather than any Recipe-driven production math; a
+reservation may legitimately exist for a Product with no corresponding `purchased_product_inventory`
+row at all, in which case physical availability is simply treated as zero for the shortage
+calculation — Phase 7 never creates a fake inventory row merely to have something to reserve against
+or lock, and neither reservation nor confirmation ever physically consumes Purchased inventory
+(actual consumption remains a Phase 8 Start/Finish-Production concern).
+
+### ADR-124 — Phase 7 Composed Lock Hierarchy
+
+Order-side workflows (confirmation, a demand-affecting `CONFIRMED` edit, cancellation) acquire locks
+in one composed, deterministic sequence: `Order` → the changed/new `Customer` if applicable → the
+unified, sorted set of every Product either newly referenced or operationally affected by the
+recalculation → newly-referenced Selling Options, sorted → the affected Recipes, in that same
+Product order → the globally sorted union of every participating Ingredient → Surplus/Purchased
+inventory state, sorted. Recipe (and first-Recipe) creation/revision use a separate, shorter
+sequence — `Product` → `Recipe` → one deterministic, globally-sorted union of every Ingredient
+referenced by every RecipeRevision participating in the Product's rebuildable closure (including a
+retained *historical* pin from an earlier `future_only` migration, not merely "the immediately-prior
+revision") plus the submitted/new RecipeRevision → Surplus state — and never acquire an Order,
+Customer, or Selling Option lock at any point, since migration only ever mutates Product-scoped
+projection/reservation state, never an Order aggregate column. This is not a simple
+`old_revision ∪ new_revision` union: because a later `apply_existing` migration can rebuild demand
+still pinned to a revision older than the immediately-prior one (ADR-125), the Ingredient set locked
+is the union across *every* revision the rebuildable closure could actually touch, computed by the
+same `revisions_participating_in_closure` helper both this lock acquisition and the Ingredient/
+Recipe lock pass in `order_lifecycle_service` share, rather than two independently-derived answers to
+the same question. Demand protected by an active `IN_PRODUCTION` run is never part of the rebuildable
+closure in the first place (ADR-126), so a revision pinned only by protected demand contributes
+nothing to this lock set.
+
+The concurrency rationale for sharing an Ingredient lock across unrelated Products is precise, not
+merely "Ingredient is acquired last" (it isn't — Surplus/Purchased state follows it on the Order-side
+path). Every workflow that touches a given Ingredient acquires that Ingredient's lock in exactly one
+deterministic, globally-sorted Ingredient phase, and that phase always occurs after every Product and
+Recipe lock the same workflow takes, and always before any Surplus/Purchased-inventory lock it takes.
+Because every competing recalculation — whichever Product, whichever workflow — follows this same
+relative ordering, and no workflow ever acquires Ingredient (or any other shared resource) in a
+reversed relative order against another, two Products' recalculations contending for one shared
+Ingredient serialize safely on that Ingredient's lock rather than creating a lock-order reversal; a
+deadlock cycle requires two transactions each waiting on a resource the other already holds, in
+opposing acquisition order, which this fixed relative ordering structurally forecloses.
+
+### ADR-125 — Recipe Revision Pinning and Impact-Choice Protocol
+
+The Recipe Revision an `OrderLine`'s demand is calculated against is never stored on the line itself
+— `OrderLine` has no `recipe_revision_id` column. The pin exists only through
+`ProductionRequirementOrder.order_line_id → ProductionRequirement.recipe_revision_id`: a line kept
+across a recalculation reuses whatever revision its existing link already points to; a line whose
+Product identity just changed, or that has no existing link at all, resolves fresh to whatever
+revision is currently `is_current` at that moment. A new Recipe Revision (or a Product's very first
+Recipe, when confirmed `INCOMPLETE_RECIPE` demand already exists for it) therefore never silently
+migrates or silently preserves existing confirmed demand — the caller must submit an explicit
+`apply_scope`. `future_only` leaves every existing confirmed link exactly as it was, on its prior
+pin; `apply_existing` migrates every eligible, *unstarted* confirmed link for that Product to the new
+revision atomically, including demand that was previously pinned to an older historical revision and
+demand that was previously `INCOMPLETE_RECIPE`. Demand covered by an active `IN_PRODUCTION` run
+(ADR-126) is never eligible for migration under either scope — it stays frozen on whatever it already
+had. When eligible affected demand exists and no `apply_scope` was submitted, the request is rejected
+with a structured `RECIPE_REVISION_IMPACT_REQUIRED` response and zero mutation (not even the new
+revision row is inserted) — there is no silently-applied default in either direction.
+
+### ADR-126 — Active-Run Protection and the Fixed/Rebuildable Split Across Surplus Allocation and Cross-Product Ingredient Shortage
+
+Phase 7 only ever *reads* whether a `ProductionRequirement` is currently referenced by an
+`IN_PRODUCTION` `ProductionRun` (via the existing `ProductionRun.source_production_requirement_id`
+FK) — it never creates or mutates a `ProductionRun` row itself (that remains Phase 8's Start/Finish
+behavior). A `ProductionRequirement` found to be so referenced is entirely protected: it is never
+recomputed, re-linked, or deleted by a recalculation pass, and no code path may alter, cancel, or
+migrate the operational demand it represents. This is conservative and whole-line, not
+partial-quantity: since the frozen schema assigns no per-Order output at Start, every `OrderLine`
+linked to a protected requirement is treated as production-locked in full. Cancel is blocked for the
+entire Order if *any* of its demand is protected (cancellation is all-or-nothing per Order); a
+demand-affecting edit or Recipe migration is instead rejected at the level of the specific protected
+line/requirement it would touch, leaving an unrelated, unprotected line on the same Order fully
+editable; and non-production metadata (pricing, notes) remains editable regardless, since it never
+touches protected operational demand at all. The frontend's read-time `production_locked` flag is
+purely advisory UI gating — every write path independently and authoritatively re-checks this rule
+under its own lock, regardless of what that flag reported.
+
+This same fixed/rebuildable principle governs two further resources a recalculation pass touches.
+For Surplus, lot priority is FEFO-style — earliest `usable_through_date` first, undated lots last,
+then oldest `produced_at`, then a stable id tie-break — and a lot's eligibility for a given demand
+item additionally requires `usable_through_date IS NULL OR usable_through_date >= max(demand_date,
+business_today)`, so a lot that has already expired as of the Business's local today is never
+resurrected merely because an overdue Order's own demand date once fell before that expiry.
+Allocations belonging to protected, `IN_PRODUCTION`-covered demand are fixed on both sides of the
+match — excluded from what the pure allocator may reassign, on the lot's remaining-quantity side and
+on the demand line's remaining-need side alike — while every other (rebuildable) allocation is
+deleted and freshly recomputed each pass; a `ProductionRequirement`'s persisted
+`surplus_allocated_quantity` is always the sum of its fixed and freshly-rebuilt portions together. For
+a shared Ingredient, the authoritative shortage read is `external/fixed reserved` (every active
+`IngredientReservation` for that Ingredient *not* belonging to this pass's own about-to-be-rebuilt
+rows) `+ fresh candidate reservations across every affected Product's own closure in this same pass`,
+compared against physical stock; a stale, about-to-be-superseded reservation from the closure
+currently being rebuilt is excluded from the "external" side specifically so it is never counted
+twice — once as stale state, once as fresh candidate state. Preview and a real Confirm/Edit read this
+identical formula, never two independently-invented ones.
+
+A direct consequence of treating a protected requirement as untouchable: the database's own partial
+unique index on `(business_id, product_id, recipe_revision_id, demand_date)` allows only one
+`ProductionRequirement` row per key, and a protected row occupying that key can never be deleted,
+recreated, or rewritten to make room for a competing mutable one — not even temporarily lifting its
+active-run protection to satisfy the constraint is permitted. When new or rebuildable demand would
+require a conflicting requirement at a key an `IN_PRODUCTION`-protected row already occupies, the
+operation is rejected outright with the structured `PRODUCTION_LOCKED_DEMAND_DATE_CONFLICT` (409)
+conflict, with zero mutation. The durable principle this encodes, independent of that specific error
+name, is that a protected operational row's identity must never be destroyed or rewritten merely to
+work around the schema's own uniqueness projection key.
+
+### ADR-127 — Draft/Confirmed Operational Preview Semantics
+
+`POST /orders/preview` and `POST /orders/{id}/preview` are zero-write end to end — every lock either
+route acquires is released by an unconditional rollback, success or failure alike, and reference
+resolution during Preview uses the identical Phase 6 line-resolution rules a real save uses but
+without `FOR UPDATE`, since a computation that is guaranteed to be discarded has no reason to hold a
+write lock. Two distinct composition rules apply depending on what's being previewed: a brand-new or
+`DRAFT` Order's preview is the current confirmed world *plus* the hypothetical proposed payload as
+additional demand; a `CONFIRMED` Order's preview is the current confirmed world *minus that Order's
+own already-persisted contribution* plus the proposed replacement — the exclusion is what prevents
+the Order being edited from being counted twice. A retained protected line's operational contribution
+is always left as fixed state in both cases, never re-added as hypothetical demand on top of its own
+already-protected requirement. A `DRAFT` with no fulfillment date yet never fabricates "today" as a
+stand-in demand date — no dated operational result (production requirements, reservations, dated
+Custom Item workload) is computed at all until a real date is supplied; only the financial subtotal
+remains available. Every operational number Preview returns comes from the exact same backend
+calculators and the exact same `recalculate_product_closure` core a real Confirm/Edit uses — never a
+second, independently-invented calculation in React — and the candidate Ingredient quantities it
+exposes are the identical, already-quantized six-decimal values a real commit would actually persist,
+which is what makes Preview and Commit numerically identical for the same input rather than merely
+similar.
+
+### ADR-128 — Warning Acknowledgment Protocol
+
+Every operational warning (`INGREDIENT_SHORTAGE`, `PURCHASED_PRODUCT_SHORTAGE`,
+`PRODUCT_MISSING_RECIPE`, and `MISSING_FULFILLMENT_TIME`) carries a stable, server-constructed
+fingerprint built entirely from authoritative identifiers and quantities (e.g.
+`f"INGREDIENT_SHORTAGE:{ingredient_id}:{shortage_quantity}"`) — never from, or coupled to, that
+warning's own human-readable `message` text, which two structurally separate functions
+(`_collect_warning_fingerprints`/`_warning_issues`) each derive independently from the same
+underlying result data. A client echoes back `acknowledged_warning_fingerprints` on
+Confirm/confirmed-edit; the server always recomputes the authoritative warning set itself, fresh,
+under its own locks, at the moment of the real write, and accepts the request only if every
+freshly-computed fingerprint is already a member of the acknowledged set. A brand-new or materially
+worsened warning (a fingerprint the caller couldn't have known about) always forces re-review; a
+warning set that has gotten strictly smaller or improved since the client last saw it is permitted to
+proceed without demanding a redundant re-acknowledgment of warnings that no longer apply. Because
+identity lives entirely in the fingerprint, the wording of a warning's `message` may be revised at any
+time (as the Manual Acceptance UX pass did, to name the specific Ingredient/unit) without touching
+acknowledgment semantics or invalidating any previously-issued fingerprint.
+
+### ADR-129 — Business-Local Time and DST-Safe Fulfillment Validation
+
+`fulfillment_date`/`fulfillment_time` are interpreted as wall-clock values in the Business's own
+timezone (`business.timezone`), never UTC or server-local time; `business_today` is derived once,
+uniformly, as `datetime.now(UTC).astimezone(ZoneInfo(business.timezone)).date()`. A supplied
+date+time combination is validated deterministically for the two ways a local wall-clock moment can
+fail to correspond to a real instant: a spring-forward gap (detected via a UTC round-trip that
+doesn't return the original wall-clock value) or a fall-back overlap (detected via comparing the
+`fold=0`/`fold=1` interpretations), and either is rejected with a structured
+`FULFILLMENT_LOCAL_TIME_INVALID` error rather than silently resolved by picking one interpretation.
+This wall-clock validity check is deliberately independent of whether a Recipe's elapsed production
+duration is known at all: a valid, unambiguous fulfillment time combined with an unknown elapsed
+duration is not an error — it simply yields `suggested_start_at = NULL`, since no exact start moment
+can be computed without a duration to subtract. When several demand lines on the same date each
+contribute their own fulfillment time to one `ProductionRequirement`'s suggested-start computation,
+every supplied (non-`None`) contributing time is individually validated for DST nonexistence/ambiguity
+*before* the earliest one is selected — a missing time on one contributing line must never mask a
+genuinely invalid supplied time on another, and an invalid non-earliest contributor must never hide
+silently behind the `min()` selection either.
+
+### ADR-130 — Shopping List Phase 7 Boundary: Cumulative-Horizon Ingredient Derivation
+
+The Phase 7 Shopping List is a read-only, backend-only derivation — no route or UI exists for it yet
+— and Ingredient-only: Purchased Product shortages are deliberately not folded into it, remaining
+surfaced only as their own operational shortage warnings, since the spec's Shopping List language is
+phrased entirely around ingredient shopping. It is computed at read time directly from
+`Ingredient.physical_quantity` and the authoritative, currently-active `IngredientReservation` rows —
+never from a persisted "shortage" value, since neither table stores one. For each Ingredient and each
+display date `D` within the horizon (defaulting to `Business.shopping_horizon_days`), the shortage is
+`max(0, cumulative_reserved_through_D - physical_quantity)`, where `cumulative_reserved_through_D`
+sums every active reservation with `demand_date <= D` — across every Product sharing that Ingredient,
+not only the one the horizon's own display is scoped to. This means an overdue active reservation
+(`demand_date` before today) always participates in every in-horizon date's cumulative figure, since
+it is `<= D` for every `D` in the horizon, while a reservation dated *beyond* the requested horizon's
+own end is never summed into an earlier date's result — later demand cannot inflate what an earlier
+display date reports.
+
+### ADR-131 — Planned Production Cost Basis and Snapshot Semantics
+
+An Ingredient's planned unit cost for a `ProductionRequirement` resolves through
+`resolve_planned_ingredient_unit_cost`: when that Ingredient's `physical_quantity > 0`, its own
+Weighted Average Unit Cost is used and is authoritative in that branch even when the Weighted
+Average Unit Cost itself is legitimately `0` — a zero physical quantity does *not* belong to this
+branch at all and instead falls to the fallback below. When `physical_quantity <= 0`, the basis
+falls back to ADR-112's existing `resolve_effective_replacement_cost` chain (`replacement_unit_cost` override, else
+`latest_purchase_unit_cost`) — the exact shared helper ADR-112 already designated for any future
+planned-cost consumer, reused rather than re-derived. If that fallback is also unknown (`None`), the
+basis for that specific Ingredient is unknown: its own
+`ProductionIngredientRequirement.estimated_unit_cost`/`estimated_total_cost` stay `NULL`, and — since
+a partial sum that silently dropped an unknown component would understate the true total — the
+aggregate `ProductionRequirement.estimated_ingredient_cost`/`estimated_direct_production_cost` are
+both left `NULL` as a whole rather than summing only the ingredients with a known cost.
+`estimated_direct_production_cost` is deliberately narrow: Ingredient cost plus labor cost only, never
+folding in Packaging, Purchased Product cost, Custom Item direct cost, or a Surplus lot's own
+unit-cost basis, each of which is either already snapshotted elsewhere (Phase 6) or explicitly
+out of scope for this field. `Order.estimated_direct_cost`/`estimated_contribution`/
+`estimated_contribution_margin` remain `NULL` throughout Phase 7 — the spec gives no authoritative
+Order-level rollup formula, so none is invented.
+
+Every planned-cost field on `ProductionRequirement` is a snapshot as of its most recent operational
+recalculation *event* (a confirmation, edit, cancellation, or migration touching that Product) — it is
+never eagerly refreshed merely because an Ingredient's own WAC or replacement cost changed
+independently. Concretely, no Ingredient-inventory mutation (Restock, Manual Adjustment, Replacement
+Cost) ever calls into Product-scoped recalculation from inside its own Ingredient-locked transaction;
+doing so would require acquiring a Product lock from inside an already-held Ingredient lock, inverting
+the fixed `Product → ... → Ingredient` relative order ADR-124 depends on, and risking a genuine
+deadlock against every other Phase 7 workflow that locks Product before Ingredient. A later real
+operational recalculation naturally picks up whatever cost inputs are current at that moment; between
+events, the planned-cost figures are expected to go stale, consistent with the spec's own three-tier
+cost terminology distinguishing "Planned" from "Actual Historical" cost.
+
+## Phase 7 Completion Status
+
+Phase 7 Operational Recalculation is implemented: real Confirm/Cancel persistence, demand-affecting
+`CONFIRMED` edits, Recipe Revision/first-Recipe impact-choice migration, Draft/Confirmed Operational
+Preview, Ingredient/Purchased-Product reservation reconciliation, active-`IN_PRODUCTION`-run
+protection, planned costing, and backend Shopping List derivation, per ADR-123 through ADR-131 above.
+Independent implementation review passed the final bundle, and manual acceptance — including the
+follow-up UX correction pass (Ingredient name/unit identification, corrected shortage-warning copy,
+human-readable quantity formatting, and corrected Custom-Item/Purchased-only empty-state display) —
+is complete.
+
+Final verified automated baseline: backend **656 passing**, frontend **211 passing**; `ruff check`
+and `ruff format --check` clean; `alembic check` reports no schema drift; TypeScript (`tsc --noEmit`)
+clean; ESLint reports zero errors; the frontend production build succeeds. No database migration was
+required or performed at any point in Phase 7 — the pre-existing Phase 1 schema was already sufficient
+for every Phase 7 table (§3 of the Phase 7 planning record). No dependency was added or changed.
+
+Phase 7 deliberately does not: create, start, or finish a `ProductionRun`; physically consume
+Ingredient inventory; physically consume Purchased Product inventory; create physical Surplus
+inventory; write a `SurplusTransaction`; write a historical `OrderCostAllocation`; implement
+`READY`/`COMPLETED` order lifecycle behavior; implement a Shopping List UI; or implement any
+Dashboard/Analytics feature. All of the above remain Phase 8+ scope.
+
+Frozen Phase 6 parent baseline: `210318d57d77554ccdde0f1fe682a10841fbca70`. Phase 7 has not yet been
+committed — no Phase 7 commit SHA is recorded here; it will be added once Phase 7 is committed and its
+own CI/freeze checkpoint is reached.

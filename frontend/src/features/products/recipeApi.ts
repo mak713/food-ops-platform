@@ -55,12 +55,20 @@ export interface RecipeContentInput {
   ingredients: RecipeRevisionIngredientLineInput[];
 }
 
+// Phase 7 Implementation Remediation Plan, Finding 3 — never silently defaulted:
+// the initial submit omits `apply_scope`; a structured `RECIPE_REVISION_IMPACT_
+// REQUIRED` (422) response means confirmed, unstarted demand exists and the seller
+// must choose explicitly before resubmitting.
+export type ApplyScope = "apply_existing" | "future_only";
+
 export interface RecipeCreateRequest extends RecipeContentInput {
   name: string;
+  apply_scope?: ApplyScope;
 }
 
 export interface RecipeRevisionCreateRequest extends RecipeContentInput {
   expected_current_revision_id: string;
+  apply_scope?: ApplyScope;
 }
 
 export interface RecipeRenameRequest {

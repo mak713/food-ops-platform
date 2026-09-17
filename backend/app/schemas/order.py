@@ -18,7 +18,7 @@ silently rounded.
 from __future__ import annotations
 
 import uuid
-from datetime import date, time
+from datetime import date, datetime, time
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -202,8 +202,154 @@ class OrderUpdateRequest(_OrderHeaderMixin):
     confirm_overpayment: bool = False
 
 
+class OrderConfirmedEditRequest(OrderUpdateRequest):
+    """Phase 7 Implementation Remediation Plan, Finding 1 — identical shape to
+    `OrderUpdateRequest` (the full proposed Order/OrderLine state, `version`,
+    `confirm_overpayment`) plus the same fingerprint-acknowledgement field
+    `OrderConfirmRequest` uses: a demand-affecting `CONFIRMED`-Order edit reuses the
+    identical fingerprint-based warning-acknowledgement protocol confirmation itself
+    uses (AC-CONF-002; Final Architecture Lock §F), never a second, separately
+    invented one. Submitted to the same `PATCH /orders/{id}` route as a Draft edit —
+    the service layer alone decides, from the Order's own current status, which
+    workflow actually applies."""
+
+    acknowledged_warning_fingerprints: list[str] = Field(default_factory=list)
+
+
 class LifecycleActionRequest(BaseModel):
     version: int
+
+
+class OrderConfirmRequest(BaseModel):
+    """Phase 7 (Plan v2 §10/§15). `acknowledged_warning_fingerprints` is the exact
+    set of operational-warning fingerprints the seller reviewed on the immediately
+    preceding Preview call — recomputed fresh under lock at confirmation time; a
+    fingerprint the server did not expect (a new or changed warning) rejects the
+    confirmation with the fresh warning set for re-review, never a silent pass."""
+
+    version: int
+    acknowledged_warning_fingerprints: list[str] = Field(default_factory=list)
+
+
+class OrderCancelRequest(BaseModel):
+    version: int
+
+
+class OperationalWarningResponse(BaseModel):
+    severity: str
+    code: str
+    message: str
+    field: str | None = None
+    resource: str
+    details: dict = Field(default_factory=dict)
+
+
+class ProductionRequirementPreviewItem(BaseModel):
+    """One (product, recipe_revision, demand_date) group's full operational picture
+    (Phase 7 Implementation Remediation Plan, Finding 2/amendment 2) — explicitly
+    separating the existing authoritative baseline from what THIS proposed Order
+    contributes, so the seller is never shown the business's entire existing demand
+    as though the Draft/Edit being previewed caused it.
+
+    `baseline_*` — the confirmed/reserved world EXCLUDING this Order's own
+    contribution (for a CONFIRMED-Order edit) or simply the current confirmed world
+    (for a new Order/Draft edit, which contributes nothing until saved).
+    `projected_*` — the same world WITH the hypothetical proposed Order/edit folded
+    in — the authoritative "after" picture, including batch/workload/timing/cost,
+    which is always a closure-total (the whole Product's picture for that group).
+    `incremental_*` — `projected - baseline`, computed here server-side: what
+    changes because of the Order being previewed, never reconstructed by the
+    frontend."""
+
+    product_id: str
+    recipe_revision_id: str | None
+    demand_date: date
+    is_protected: bool
+    missing_recipe: bool
+
+    baseline_confirmed_demand_quantity: Decimal
+    baseline_surplus_allocated_quantity: Decimal
+    baseline_production_demand_quantity: Decimal
+    baseline_recommended_batches: int | None
+
+    projected_confirmed_demand_quantity: Decimal
+    projected_surplus_allocated_quantity: Decimal
+    projected_production_demand_quantity: Decimal
+    projected_recommended_batches: int | None
+    projected_expected_output_quantity: Decimal | None
+    projected_expected_excess_quantity: Decimal | None
+    projected_estimated_active_minutes: int | None
+    projected_estimated_elapsed_minutes: int | None
+    projected_estimated_ingredient_cost: Decimal | None
+    projected_estimated_labor_cost: Decimal | None
+    projected_estimated_direct_production_cost: Decimal | None
+    projected_suggested_start_at: datetime | None
+
+    incremental_confirmed_demand_quantity: Decimal
+    incremental_production_demand_quantity: Decimal
+
+
+class IngredientAvailabilityPreviewItem(BaseModel):
+    """Cross-Product Ingredient availability (Final Architecture Lock §E) — the
+    physical stock is the same before/after (Preview writes nothing); the shortage
+    reflects the baseline vs. projected reservation total against it."""
+
+    ingredient_id: str
+    ingredient_name: str
+    canonical_unit: str
+    physical_quantity: Decimal
+    baseline_shortage_quantity: Decimal
+    projected_shortage_quantity: Decimal
+
+
+class PurchasedShortagePreviewItem(BaseModel):
+    product_id: str
+    baseline_shortage_quantity: Decimal
+    projected_shortage_quantity: Decimal
+
+
+class CustomItemWorkloadPreviewItem(BaseModel):
+    """Manual/custom workload guidance — never routed through a
+    Product/Recipe/ProductionRequirement/Ingredient reservation (ORD-009/010),
+    clearly labeled and structurally separate from batch-derived workload.
+    Baseline (confirmed world) vs. projected (confirmed world + hypothetical)
+    split (Phase 7 Final Remediation Correction Plan, Finding 6) — the same
+    convention `ProductionRequirementPreviewItem` already uses."""
+
+    demand_date: date
+    baseline_total_active_minutes: int
+    projected_total_active_minutes: int
+    baseline_contributing_line_count: int
+    projected_contributing_line_count: int
+
+
+class OperationalPreviewResponse(BaseModel):
+    """Phase 7 Draft Operational Preview (Spec §11.5; Plan v2 §12) — zero-write,
+    computed by the same `recalculate_product_closure` core the real Confirm path
+    uses. `warning_fingerprints` is the exact set to echo back, acknowledged, on a
+    subsequent `OrderConfirmRequest`/`OrderConfirmedEditRequest` for these warnings
+    to be accepted without re-review.
+
+    Exposes the authoritative operational picture the seller needs (Phase 7
+    Implementation Remediation Plan, Finding 2) — not merely financial totals and
+    fingerprints — and, per that same finding's amendment, `warnings`/
+    `custom_item_workload` carry pre-computed, labeled detail so the frontend never
+    reconstructs operational deltas of its own."""
+
+    subtotal: Decimal
+    final_total: Decimal
+    warnings: list[OperationalWarningResponse]
+    warning_fingerprints: list[str]
+    production_requirements: list[ProductionRequirementPreviewItem] = Field(default_factory=list)
+    ingredient_availability: list[IngredientAvailabilityPreviewItem] = Field(default_factory=list)
+    purchased_shortages: list[PurchasedShortagePreviewItem] = Field(default_factory=list)
+    custom_item_workload: list[CustomItemWorkloadPreviewItem] = Field(default_factory=list)
+    # Phase 7 Final Semantic & Precision Correction Plan, Finding 5 — a plain
+    # advisory flag (never a fingerprinted warning; never gates saving or
+    # requires acknowledgment): true when no fulfillment date is available yet,
+    # so no operational demand was computed (financial subtotal/final_total are
+    # still authoritative above).
+    fulfillment_date_required_for_operational_preview: bool = False
 
 
 # --- Responses -------------------------------------------------------------------------
@@ -277,6 +423,11 @@ class OrderResponse(BaseModel):
     overpayment_amount: Decimal | None
     is_confirmable: bool
     confirmation_issues: list[ConfirmationIssueResponse]
+    # Phase 7 (Plan v2 §7 / Final Architecture Lock §C/§7): a derived, non-persisted,
+    # read-time-only signal for UI gating — never trusted for correctness. Every
+    # write path independently re-checks the authoritative active-run condition
+    # under its own operational lock regardless of what this field reports.
+    production_locked: bool = False
 
 
 class OrderSummary(BaseModel):

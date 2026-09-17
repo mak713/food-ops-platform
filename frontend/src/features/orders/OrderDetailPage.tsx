@@ -1,7 +1,20 @@
 // Order Details (Final Plan §I): identity/status, fulfillment info, line snapshots,
 // customer-facing totals, Payment history + inline add-form, derived payment
-// status/overpayment, typed structural-readiness indicator (never a Confirm button —
-// Final Plan §C), Draft-only actions (Edit/Delete-with-warning).
+// status/overpayment, Draft-only actions (Edit/Delete-with-warning).
+//
+// Phase 7: real Confirm (DRAFT -> CONFIRMED) and Cancel (CONFIRMED -> CANCELED)
+// actions, replacing the old "structural readiness only" placeholder. A rejected
+// Confirm carrying operational warnings (`OPERATIONAL_WARNINGS_REQUIRE_ACKNOWLEDGEMENT`)
+// opens one consolidated warning-review dialog — never a sequential modal chain —
+// listing every warning at once; resubmitting echoes back each warning's own
+// server-issued `details.fingerprint` unmodified (fingerprint construction stays
+// entirely backend-owned, Plan v2 §10). `production_locked` is read-only/advisory
+// and gates the Cancel action, and the Edit form's operational fields, in the UI
+// only — the backend independently and authoritatively re-checks under its own
+// lock regardless of this flag (Final Architecture Lock §C). Edit routes a
+// CONFIRMED order to the same OrderEntryPage as a Draft edit — that page decides,
+// from the order's own status, which Phase 7 service workflow the save actually
+// uses (`update_confirmed_order` vs the Phase 6 `update_draft_order`).
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -13,6 +26,7 @@ import { CurrencyInput } from "../../components/shared/CurrencyInput";
 import { ErrorBanner } from "../../components/shared/ErrorBanner";
 import { FormField } from "../../components/shared/FormField";
 import { StaleVersionPanel } from "../../components/shared/StaleVersionPanel";
+import { formatQuantityForDisplay } from "../../lib/decimal";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -76,6 +90,42 @@ export function OrderDetailPage() {
       navigate("/app/orders");
     },
   });
+
+  const confirmMutation = useMutation({
+    mutationFn: (fingerprints: string[]) =>
+      ordersApi.confirm(id as string, {
+        version: query.data!.version,
+        acknowledged_warning_fingerprints: fingerprints,
+      }),
+    onSuccess: invalidate,
+  });
+  const cancelMutation = useMutation({
+    mutationFn: () => ordersApi.cancel(id as string, { version: query.data!.version }),
+    onSuccess: invalidate,
+  });
+
+  const confirmWarningIssues =
+    confirmMutation.error instanceof ApiError &&
+    confirmMutation.error.body?.error.code === "OPERATIONAL_WARNINGS_REQUIRE_ACKNOWLEDGEMENT"
+      ? confirmMutation.error.body.error.issues
+      : undefined;
+  const confirmGenericError =
+    confirmMutation.isError && !confirmWarningIssues
+      ? confirmMutation.error instanceof ApiError
+        ? confirmMutation.error.body?.error.message
+        : "Something went wrong confirming the order. Please try again."
+      : undefined;
+  const cancelGenericError =
+    cancelMutation.isError && cancelMutation.error instanceof ApiError
+      ? cancelMutation.error.body?.error.message
+      : undefined;
+
+  const handleConfirmAnyway = () => {
+    const fingerprints = (confirmWarningIssues ?? [])
+      .map((issue) => issue.details.fingerprint)
+      .filter((f): f is string => typeof f === "string");
+    confirmMutation.mutate(fingerprints);
+  };
 
   const {
     register,
@@ -237,9 +287,7 @@ export function OrderDetailPage() {
                 <TableRow key={line.id}>
                   <TableCell>
                     {line.display_name_snapshot}
-                    {line.notes && (
-                      <p className="text-xs text-muted-foreground">{line.notes}</p>
-                    )}
+                    {line.notes && <p className="text-xs text-muted-foreground">{line.notes}</p>}
                     {/* Internal-only Custom Item detail — visually separate (muted,
                         boxed) from the customer-facing Qty/Price/Subtotal columns
                         (Checkpoint-3 correction 18). No manual_fulfillment_satisfied
@@ -266,8 +314,8 @@ export function OrderDetailPage() {
                   </TableCell>
                   <TableCell>
                     {line.line_type === "STANDARD_OPTION"
-                      ? `${line.package_quantity} pkg`
-                      : line.underlying_quantity}
+                      ? `${formatQuantityForDisplay(line.package_quantity)} pkg`
+                      : formatQuantityForDisplay(line.underlying_quantity)}
                   </TableCell>
                   <TableCell>${line.charged_unit_price_snapshot}</TableCell>
                   <TableCell>${line.line_subtotal}</TableCell>
@@ -367,21 +415,111 @@ export function OrderDetailPage() {
           )}
         </section>
 
-        <section className="rounded-md border border-dashed p-3 text-sm">
-          <h2 className="mb-1 font-semibold">Structural readiness</h2>
-          {order.is_confirmable ? (
-            <p className="text-green-700">✓ Structurally ready for confirmation.</p>
-          ) : (
-            <ul className="list-inside list-disc text-muted-foreground">
-              {order.confirmation_issues.map((issue) => (
-                <li key={issue.code}>{issue.message}</li>
-              ))}
-            </ul>
-          )}
-          <p className="mt-1 text-xs text-muted-foreground">
-            Real order confirmation is available in a future phase.
-          </p>
-        </section>
+        {isDraft && (
+          <section className="rounded-md border border-dashed p-3 text-sm">
+            <h2 className="mb-1 font-semibold">Confirmation</h2>
+            {order.is_confirmable ? (
+              <p className="mb-2 text-green-700">✓ Structurally ready for confirmation.</p>
+            ) : (
+              <ul className="mb-2 list-inside list-disc text-muted-foreground">
+                {order.confirmation_issues.map((issue) => (
+                  <li key={issue.code}>{issue.message}</li>
+                ))}
+              </ul>
+            )}
+
+            {confirmWarningIssues ? (
+              <div className="flex flex-col gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-3">
+                <p className="font-semibold">Review before confirming</p>
+                <ul className="list-inside list-disc">
+                  {confirmWarningIssues.map((issue, index) => (
+                    <li key={`${issue.code}-${index}`} role="alert">
+                      {issue.message}
+                    </li>
+                  ))}
+                </ul>
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={handleConfirmAnyway}
+                  disabled={confirmMutation.isPending}
+                >
+                  Confirm anyway
+                </Button>
+              </div>
+            ) : (
+              <>
+                {confirmGenericError && (
+                  <p role="alert" className="mb-2 text-sm text-destructive">
+                    {confirmGenericError}
+                  </p>
+                )}
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={!order.is_confirmable || confirmMutation.isPending}
+                  onClick={() => confirmMutation.mutate([])}
+                >
+                  Confirm Order
+                </Button>
+              </>
+            )}
+          </section>
+        )}
+
+        {order.status === "CONFIRMED" && (
+          <section className="rounded-md border border-dashed p-3 text-sm">
+            <h2 className="mb-1 font-semibold">Confirmed</h2>
+            {order.production_locked ? (
+              <p className="mb-2 text-amber-700">
+                Some of this order's demand is covered by an active production run. It cannot be
+                canceled until that run completes or is canceled, and its operational fields
+                (quantity, product, date, time) are read-only here for the same reason — pricing
+                and notes can still be edited. The server independently re-checks this for every
+                change, regardless of what this notice reports.
+              </p>
+            ) : null}
+            {cancelGenericError && (
+              <p role="alert" className="mb-2 text-sm text-destructive">
+                {cancelGenericError}
+              </p>
+            )}
+            <div className="flex items-center gap-2">
+              <Link
+                to={`/app/orders/${order.id}/edit`}
+                className={buttonVariants({ variant: "outline", size: "sm" })}
+              >
+                Edit
+              </Link>
+              <AlertDialog>
+                <AlertDialogTrigger
+                  className={buttonVariants({ variant: "destructive", size: "sm" })}
+                  disabled={order.production_locked}
+                >
+                  Cancel Order
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>Cancel this order?</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      This releases any reserved ingredients, purchased stock, and surplus
+                      allocated to it. This cannot be undone.
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>Keep order</AlertDialogCancel>
+                    <AlertDialogAction
+                      className={buttonVariants({ variant: "destructive" })}
+                      onClick={() => cancelMutation.mutate()}
+                    >
+                      Cancel order
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            </div>
+          </section>
+        )}
 
         {staleVersionOccurred && <StaleVersionPanel onRefresh={handleRefreshAfterStaleVersion} />}
 
@@ -393,7 +531,10 @@ export function OrderDetailPage() {
 
         {isDraft && (
           <div className="flex items-center gap-2">
-            <Link to={`/app/orders/${order.id}/edit`} className={buttonVariants({ variant: "outline" })}>
+            <Link
+              to={`/app/orders/${order.id}/edit`}
+              className={buttonVariants({ variant: "outline" })}
+            >
               Edit
             </Link>
 
@@ -418,8 +559,8 @@ export function OrderDetailPage() {
                   <AlertDialogHeader>
                     <AlertDialogTitle>Delete this draft order?</AlertDialogTitle>
                     <AlertDialogDescription>
-                      This cannot be undone. If it has recorded payments, you will be
-                      warned before they are deleted too.
+                      This cannot be undone. If it has recorded payments, you will be warned before
+                      they are deleted too.
                     </AlertDialogDescription>
                   </AlertDialogHeader>
                   <AlertDialogFooter>

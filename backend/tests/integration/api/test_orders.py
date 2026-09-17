@@ -472,11 +472,19 @@ def test_update_rejects_line_id_from_another_order(client):
     assert response.json()["error"]["issues"][0]["code"] == "UNKNOWN_ORDER_LINE_ID"
 
 
-def test_update_non_draft_order_is_rejected(client, session):
+def test_update_canceled_order_is_rejected(client, session):
+    """`PATCH /orders/{id}` dispatches a CONFIRMED order to the new Phase 7
+    `update_confirmed_order` workflow (Finding 1) — CONFIRMED is no longer a
+    "non-draft, always rejected" status, so this test (renamed from the Phase 6
+    original `test_update_non_draft_order_is_rejected`, which used CONFIRMED as
+    its example) now uses CANCELED instead, the one status that genuinely remains
+    non-editable through this route. The positive CONFIRMED-edit-now-works case is
+    covered by `test_confirmed_order_edit_updates_quantity_and_reservations` and
+    its siblings below."""
     signup(client)
     created = client.post("/api/v1/orders", json={}, headers=csrf_headers(client)).json()
     order_row = session.execute(select(Order).where(Order.id == created["id"])).scalar_one()
-    order_row.status = "CONFIRMED"
+    order_row.status = "CANCELED"
     session.commit()
     session.refresh(order_row)  # version_id_col bumps on this direct mutation too
 
@@ -825,16 +833,27 @@ def test_delete_stale_version_returns_409(client):
     assert response.json()["error"]["code"] == "STALE_VERSION"
 
 
-# --- Lifecycle boundary: Phase 6 never persists CONFIRMED, never writes Phase 7+ rows ---
+# --- Lifecycle boundary: Phase 6 never persists CONFIRMED, never writes Phase 7+ rows.
+# Phase 7 adds a real POST .../confirm route (Plan v2 §15) — the test below is the
+# Plan v2 §19-documented, explicitly-approved replacement for the old
+# `test_no_confirm_route_exists` (the route now genuinely exists; this proves its
+# real rejection behavior instead of its prior absence). ---
 
 
-def test_no_confirm_route_exists(client):
+def test_confirm_route_rejects_structurally_incomplete_draft_with_zero_mutation(client):
     signup(client)
     created = client.post("/api/v1/orders", json={}, headers=csrf_headers(client)).json()
     response = client.post(
-        f"/api/v1/orders/{created['id']}/confirm", json={}, headers=csrf_headers(client)
+        f"/api/v1/orders/{created['id']}/confirm",
+        json={"version": created["version"]},
+        headers=csrf_headers(client),
     )
-    assert response.status_code in (404, 405)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "ORDER_NOT_CONFIRMABLE"
+
+    reloaded = client.get(f"/api/v1/orders/{created['id']}").json()
+    assert reloaded["status"] == "DRAFT"
+    assert reloaded["version"] == created["version"]
 
 
 def test_confirmation_readiness_reflects_structural_state_without_mutating(client):
@@ -1404,3 +1423,419 @@ def test_phase6_operations_create_zero_phase7_operational_rows(client, session):
     ):
         count = session.scalar(select(sa_func.count()).select_from(model))
         assert count == 0, f"{model.__name__} must remain empty after Phase 6 operations"
+
+
+# --- Phase 7 Implementation Remediation Plan, Finding 10: tenant isolation for the ------
+# --- new confirm/cancel/preview endpoints, and stale-version coverage on each. ---------
+
+
+def test_foreign_tenant_order_confirm_returns_non_revealing_404(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    created = client.post("/api/v1/orders", json={}, headers=csrf_headers(client)).json()
+
+    _use_session(client, tenants["b"])
+    response = client.post(
+        f"/api/v1/orders/{created['id']}/confirm",
+        json={"version": created["version"]},
+        headers=csrf_headers(client),
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_foreign_tenant_order_cancel_returns_non_revealing_404(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    created = client.post("/api/v1/orders", json={}, headers=csrf_headers(client)).json()
+
+    _use_session(client, tenants["b"])
+    response = client.post(
+        f"/api/v1/orders/{created['id']}/cancel",
+        json={"version": created["version"]},
+        headers=csrf_headers(client),
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_foreign_tenant_order_preview_existing_returns_non_revealing_404(client):
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    created = client.post("/api/v1/orders", json={}, headers=csrf_headers(client)).json()
+
+    _use_session(client, tenants["b"])
+    response = client.post(
+        f"/api/v1/orders/{created['id']}/preview",
+        json={"lines": []},
+        headers=csrf_headers(client),
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_foreign_tenant_confirmed_order_edit_returns_non_revealing_404(client):
+    """The same PATCH route Draft edits use also carries `update_confirmed_order`
+    (Finding 1) — tenant scoping must hold for the CONFIRMED dispatch path too, not
+    only the DRAFT one already covered elsewhere in this file."""
+    tenants = _signup_two_businesses(client)
+    _use_session(client, tenants["a"])
+    created = client.post("/api/v1/orders", json={}, headers=csrf_headers(client)).json()
+
+    _use_session(client, tenants["b"])
+    response = client.patch(
+        f"/api/v1/orders/{created['id']}",
+        json={"version": created["version"], "lines": []},
+        headers=csrf_headers(client),
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_confirm_stale_version_returns_409(client, session):
+    signup(client)
+    created = client.post(
+        "/api/v1/orders",
+        json={
+            "lines": [
+                {
+                    "line_type": "CUSTOM_ITEM",
+                    "underlying_quantity": "1",
+                    "charged_unit_price": "5.00",
+                    "display_name": "Widget",
+                }
+            ],
+            "fulfillment_date": "2026-02-01",
+        },
+        headers=csrf_headers(client),
+    ).json()
+
+    order_row = session.get(Order, created["id"])
+    order_row.version += 1
+    session.commit()
+
+    response = client.post(
+        f"/api/v1/orders/{created['id']}/confirm",
+        json={"version": created["version"]},
+        headers=csrf_headers(client),
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "STALE_VERSION"
+
+    reloaded = client.get(f"/api/v1/orders/{created['id']}").json()
+    assert reloaded["status"] == "DRAFT"
+
+
+def test_cancel_stale_version_returns_409(client, session):
+    signup(client)
+    created = client.post(
+        "/api/v1/orders",
+        json={
+            "lines": [
+                {
+                    "line_type": "CUSTOM_ITEM",
+                    "underlying_quantity": "1",
+                    "charged_unit_price": "5.00",
+                    "display_name": "Widget",
+                }
+            ],
+            "fulfillment_date": "2026-02-01",
+            "fulfillment_time": "09:00:00",
+        },
+        headers=csrf_headers(client),
+    ).json()
+    confirmed = client.post(
+        f"/api/v1/orders/{created['id']}/confirm",
+        json={"version": created["version"]},
+        headers=csrf_headers(client),
+    ).json()
+
+    order_row = session.get(Order, created["id"])
+    order_row.version += 1
+    session.commit()
+
+    response = client.post(
+        f"/api/v1/orders/{created['id']}/cancel",
+        json={"version": confirmed["version"]},
+        headers=csrf_headers(client),
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "STALE_VERSION"
+
+    reloaded = client.get(f"/api/v1/orders/{created['id']}").json()
+    assert reloaded["status"] == "CONFIRMED"
+
+
+def test_confirmed_edit_stale_version_returns_409(client, session):
+    """`update_confirmed_order` (Finding 1) reuses `check_version` under the same
+    Order row lock as every other Phase 6/7 mutation."""
+    signup(client)
+    created = client.post(
+        "/api/v1/orders",
+        json={
+            "lines": [
+                {
+                    "line_type": "CUSTOM_ITEM",
+                    "underlying_quantity": "1",
+                    "charged_unit_price": "5.00",
+                    "display_name": "Widget",
+                }
+            ],
+            "fulfillment_date": "2026-02-01",
+            "fulfillment_time": "09:00:00",
+        },
+        headers=csrf_headers(client),
+    ).json()
+    confirmed = client.post(
+        f"/api/v1/orders/{created['id']}/confirm",
+        json={"version": created["version"]},
+        headers=csrf_headers(client),
+    ).json()
+
+    order_row = session.get(Order, created["id"])
+    order_row.version += 1
+    session.commit()
+
+    response = client.patch(
+        f"/api/v1/orders/{created['id']}",
+        json={
+            "version": confirmed["version"],
+            "internal_notes": "stale edit attempt",
+            "lines": [
+                {
+                    "id": confirmed["lines"][0]["id"],
+                    "line_type": "CUSTOM_ITEM",
+                    "underlying_quantity": "1",
+                    "charged_unit_price": "5.00",
+                    "display_name": "Widget",
+                }
+            ],
+        },
+        headers=csrf_headers(client),
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "STALE_VERSION"
+
+
+def test_preview_custom_item_workload_creates_no_rows(client, session):
+    """Custom Item manual workload (Finding 5, extended by Finding 6's baseline/
+    projected split) is surfaced by Preview without ever routing through
+    `recalculate_product_closure` — a Custom Item line has no `product_id` at all
+    (ORD-009), so this needs no Product/Recipe/Ingredient setup. A brand-new Order
+    has no confirmed-world contribution yet, so baseline is legitimately zero here
+    — see `test_preview_custom_item_workload_baseline_excludes_this_orders_own_
+    confirmed_contribution` for the confirmed-world/substitution case."""
+    from sqlalchemy import func as sa_func
+
+    from app.db.models.production import ProductionRequirement
+
+    signup(client)
+    response = client.post(
+        "/api/v1/orders/preview",
+        json={
+            "lines": [
+                {
+                    "line_type": "CUSTOM_ITEM",
+                    "underlying_quantity": "1",
+                    "charged_unit_price": "40.00",
+                    "display_name": "Custom cake",
+                    "custom_active_time_minutes": 90,
+                }
+            ],
+            "fulfillment_date": "2026-02-01",
+            "fulfillment_time": "09:00:00",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["custom_item_workload"] == [
+        {
+            "demand_date": "2026-02-01",
+            "baseline_total_active_minutes": 0,
+            "projected_total_active_minutes": 90,
+            "baseline_contributing_line_count": 0,
+            "projected_contributing_line_count": 1,
+        }
+    ]
+    assert body["production_requirements"] == []
+    count = session.scalar(select(sa_func.count()).select_from(ProductionRequirement))
+    assert count == 0
+
+
+def test_preview_custom_item_workload_baseline_reflects_confirmed_world(client):
+    """Phase 7 Final Remediation Correction Plan, Finding 6 — confirm one Order
+    with a Custom Item line (30 min, date D), then Preview a second new Order
+    with its own Custom Item line (45 min, same date D): baseline must reflect
+    the first Order's already-confirmed 30 minutes (never zero, which is what the
+    hypothetical-only bug this corrects would report), and projected must reflect
+    the combined 75."""
+    signup(client)
+    confirmed = client.post(
+        "/api/v1/orders",
+        json={
+            "lines": [
+                {
+                    "line_type": "CUSTOM_ITEM",
+                    "underlying_quantity": "1",
+                    "charged_unit_price": "40.00",
+                    "display_name": "Custom cake",
+                    "custom_active_time_minutes": 30,
+                }
+            ],
+            "fulfillment_date": "2026-02-01",
+            "fulfillment_time": "09:00:00",
+        },
+        headers=csrf_headers(client),
+    ).json()
+    client.post(
+        f"/api/v1/orders/{confirmed['id']}/confirm",
+        json={"version": confirmed["version"]},
+        headers=csrf_headers(client),
+    )
+
+    response = client.post(
+        "/api/v1/orders/preview",
+        json={
+            "lines": [
+                {
+                    "line_type": "CUSTOM_ITEM",
+                    "underlying_quantity": "1",
+                    "charged_unit_price": "60.00",
+                    "display_name": "Custom pie",
+                    "custom_active_time_minutes": 45,
+                }
+            ],
+            "fulfillment_date": "2026-02-01",
+            "fulfillment_time": "09:00:00",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["custom_item_workload"] == [
+        {
+            "demand_date": "2026-02-01",
+            "baseline_total_active_minutes": 30,
+            "projected_total_active_minutes": 75,
+            "baseline_contributing_line_count": 1,
+            "projected_contributing_line_count": 2,
+        }
+    ]
+
+
+def test_preview_custom_item_workload_confirmed_edit_excludes_own_baseline_contribution(
+    client,
+):
+    """Confirmed-edit substitution variant (Finding 6's own explicit ask): editing
+    Order A's own Custom Item line must exclude Order A's own persisted 30
+    minutes from baseline (it is about to be replaced by the hypothetical
+    payload) — baseline reflects only sibling Order B's unrelated 45 minutes,
+    never double-counting Order A's own contribution against itself."""
+    signup(client)
+    order_b = client.post(
+        "/api/v1/orders",
+        json={
+            "lines": [
+                {
+                    "line_type": "CUSTOM_ITEM",
+                    "underlying_quantity": "1",
+                    "charged_unit_price": "60.00",
+                    "display_name": "Sibling cake",
+                    "custom_active_time_minutes": 45,
+                }
+            ],
+            "fulfillment_date": "2026-02-01",
+            "fulfillment_time": "09:00:00",
+        },
+        headers=csrf_headers(client),
+    ).json()
+    client.post(
+        f"/api/v1/orders/{order_b['id']}/confirm",
+        json={"version": order_b["version"]},
+        headers=csrf_headers(client),
+    )
+
+    order_a = client.post(
+        "/api/v1/orders",
+        json={
+            "lines": [
+                {
+                    "line_type": "CUSTOM_ITEM",
+                    "underlying_quantity": "1",
+                    "charged_unit_price": "40.00",
+                    "display_name": "Custom cake",
+                    "custom_active_time_minutes": 30,
+                }
+            ],
+            "fulfillment_date": "2026-02-01",
+            "fulfillment_time": "09:00:00",
+        },
+        headers=csrf_headers(client),
+    ).json()
+    confirmed_a = client.post(
+        f"/api/v1/orders/{order_a['id']}/confirm",
+        json={"version": order_a["version"]},
+        headers=csrf_headers(client),
+    ).json()
+
+    # Preview raising Order A's own Custom Item line from 30 to 50 minutes.
+    response = client.post(
+        f"/api/v1/orders/{confirmed_a['id']}/preview",
+        json={
+            "lines": [
+                {
+                    "id": confirmed_a["lines"][0]["id"],
+                    "line_type": "CUSTOM_ITEM",
+                    "underlying_quantity": "1",
+                    "charged_unit_price": "40.00",
+                    "display_name": "Custom cake",
+                    "custom_active_time_minutes": 50,
+                }
+            ],
+            "fulfillment_date": "2026-02-01",
+            "fulfillment_time": "09:00:00",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["custom_item_workload"] == [
+        {
+            "demand_date": "2026-02-01",
+            "baseline_total_active_minutes": 45,  # sibling Order B only, not A's own 30
+            "projected_total_active_minutes": 95,  # B(45) + A(50), never 30+45+50
+            "baseline_contributing_line_count": 1,
+            "projected_contributing_line_count": 2,
+        }
+    ]
+
+
+def test_preview_missing_fulfillment_time_warns_for_purchased_only_order(client):
+    """Finding 4/amendment 1: MISSING_FULFILLMENT_TIME is an Order-level warning —
+    it must fire even for an order with no Produced-Product line at all (no
+    ProductionRequirement is ever involved for a Purchased Product)."""
+    signup(client)
+    product = client.post(
+        "/api/v1/products",
+        json={"name": "Jarred Honey", "product_type": "PURCHASED"},
+        headers=csrf_headers(client),
+    ).json()
+
+    response = client.post(
+        "/api/v1/orders/preview",
+        json={
+            "lines": [
+                {
+                    "line_type": "CUSTOM_QUANTITY",
+                    "product_id": product["id"],
+                    "underlying_quantity": "2",
+                    "charged_unit_price": "8.00",
+                }
+            ],
+            "fulfillment_date": "2026-02-01",
+            # fulfillment_time deliberately omitted.
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    codes = [w["code"] for w in body["warnings"]]
+    assert "MISSING_FULFILLMENT_TIME" in codes
+    assert len(body["warning_fingerprints"]) >= 1

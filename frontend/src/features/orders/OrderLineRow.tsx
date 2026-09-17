@@ -33,6 +33,14 @@ interface OrderLineRowProps {
   remove: (index: number) => void;
   products: ProductSummary[];
   errorMessage?: string;
+  // Phase 7 Final Remediation Correction Plan, Finding 3 — set only while this
+  // Order is CONFIRMED and `production_locked`. Applies ONLY to the controls that
+  // change Produced/Purchased demand identity or quantity (line-type Select,
+  // Product/Selling-Option picker, `package_quantity`, `underlying_quantity` for
+  // CUSTOM_QUANTITY, and Remove) — never to price, packaging, notes, or any
+  // CUSTOM_ITEM field, which the Final Architecture Lock §C requires to stay
+  // editable regardless of lock status.
+  operationalDisabled?: boolean;
 }
 
 export function OrderLineRow({
@@ -43,6 +51,7 @@ export function OrderLineRow({
   remove,
   products,
   errorMessage,
+  operationalDisabled = false,
 }: OrderLineRowProps) {
   const line = useWatch({ control, name: `lines.${index}` });
   const lineType = line?.line_type;
@@ -93,6 +102,7 @@ export function OrderLineRow({
             // of meaningful controlled edit the unsaved-changes blocker exists for.
             setValue(`lines.${index}`, emptyLine(value as OrderLineType), { shouldDirty: true })
           }
+          disabled={operationalDisabled}
         >
           <SelectTrigger aria-label={`Line ${index + 1} type`}>
             <SelectValue />
@@ -103,7 +113,13 @@ export function OrderLineRow({
             <SelectItem value="CUSTOM_ITEM">Custom Item</SelectItem>
           </SelectContent>
         </Select>
-        <Button type="button" variant="ghost" size="sm" onClick={() => remove(index)}>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={() => remove(index)}
+          disabled={operationalDisabled}
+        >
           Remove
         </Button>
       </div>
@@ -114,6 +130,7 @@ export function OrderLineRow({
             productId={line?.product_id || null}
             sellingOptionId={line?.selling_option_id || null}
             fallbackDisplayName={line?.display_name}
+            disabled={operationalDisabled}
             onChange={(productId, sellingOptionId) => {
               // A genuine source-identity change (new id differs from what's stored),
               // not a same-id reselection — mirrors the backend's own
@@ -150,6 +167,7 @@ export function OrderLineRow({
             <Input
               id={`lines.${index}.package_quantity`}
               inputMode="decimal"
+              disabled={operationalDisabled}
               {...register(`lines.${index}.package_quantity`)}
             />
           </FormField>
@@ -232,6 +250,7 @@ export function OrderLineRow({
               // unsaved-changes blocker exists to catch.
               setValue(`lines.${index}.product_id`, value ?? "", { shouldDirty: true })
             }
+            disabled={operationalDisabled}
           >
             <SelectTrigger aria-label={`Line ${index + 1} product`}>
               {/* Render-prop, not a plain `placeholder` — a carried-forward inactive
@@ -284,6 +303,7 @@ export function OrderLineRow({
             <Input
               id={`lines.${index}.underlying_quantity`}
               inputMode="decimal"
+              disabled={operationalDisabled}
               {...register(`lines.${index}.underlying_quantity`)}
             />
           </FormField>

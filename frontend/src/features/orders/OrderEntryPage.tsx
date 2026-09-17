@@ -9,7 +9,30 @@
 // internal render key can never be accidentally submitted as an OrderLine UUID (Final
 // Pre-Implementation Amendment §8).
 //
-// No Confirm button anywhere (Final Plan §C) — this page only creates/edits a Draft.
+// No Confirm button anywhere (Final Plan §C) — this page only creates/edits a Draft or
+// (Phase 7 Implementation Remediation Plan, Finding 1) a CONFIRMED order's fields; the
+// save button routes to whichever of `update_draft_order`/`update_confirmed_order` the
+// backend decides applies, from the order's own current status — never a second,
+// frontend-invented lifecycle transition. A demand-affecting save against a CONFIRMED
+// order that raises operational warnings opens the same consolidated warning-review
+// dialog OrderDetailPage's Confirm action uses (`OPERATIONAL_WARNINGS_REQUIRE_
+// ACKNOWLEDGEMENT`), never a second, differently-shaped one. When the order is
+// production-locked (Final Architecture Lock §C), fulfillment date/time are grayed out
+// via a disabled `<fieldset>` (both fields are genuinely operational together, so a
+// whole-fieldset treatment there is not coarser than necessary), while each Order Item
+// row disables only its demand-affecting controls (line type, Product/Selling-Option
+// source, package/underlying quantity, Remove — via `OrderLineRow`'s own
+// `operationalDisabled` prop, Phase 7 Final Remediation Correction Plan, Finding 3) —
+// price, price-override reason, packaging cost, and notes remain editable on every row
+// regardless of lock status, per the Lock's explicit "non-production fields remain
+// editable" requirement. Add-line buttons stay conservatively disabled as a whole
+// (adding a new line is itself an operational change the Lock's "purely for UX
+// simplicity" allowance still covers).
+//
+// Operational Impact Preview (Finding 2) is a real, debounced call to
+// `ordersApi.preview`/`previewExisting` — never independent operational math in
+// React. It renders the server's own baseline/projected/incremental split (Finding 2
+// amendment 2) directly; no delta is ever computed client-side.
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -21,6 +44,7 @@ import { CurrencyInput } from "../../components/shared/CurrencyInput";
 import { ErrorBanner } from "../../components/shared/ErrorBanner";
 import { FormField } from "../../components/shared/FormField";
 import { StaleVersionPanel } from "../../components/shared/StaleVersionPanel";
+import { formatQuantityForDisplay } from "../../lib/decimal";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -50,7 +74,7 @@ import {
 import { Textarea } from "../../components/ui/textarea";
 import { customersApi } from "../customers/api";
 import { productsApi, type Product } from "../products/api";
-import { ordersApi, type OrderLine, type OrderLineInput } from "./api";
+import { ordersApi, type OrderCreateRequest, type OrderLine, type OrderLineInput } from "./api";
 import { OrderLineRow } from "./OrderLineRow";
 import { emptyLine, schema, toFormValues, type FormValues, type LineFormValue } from "./orderFormTypes";
 
@@ -132,6 +156,26 @@ function toLineInput(line: LineFormValue): OrderLineInput {
         : null,
     manual_fulfillment_required: isCustomItem ? (line.manual_fulfillment_required ?? null) : null,
     notes: line.notes || null,
+  };
+}
+
+// Builds the exact same OrderCreateRequest-shaped body the real save would submit
+// (Finding 2 — "resolves every proposed line through the same server-side rules...
+// never trusts client-computed... numbers"), so Preview always reflects the
+// authoritative save-time resolution, never a client-only guess.
+function buildPreviewPayload(values: FormValues): OrderCreateRequest {
+  return {
+    customer_id: values.customer_id || null,
+    fulfillment_date: values.fulfillment_date || null,
+    fulfillment_time: values.fulfillment_time || null,
+    fulfillment_method: (values.fulfillment_method as never) || null,
+    fulfillment_details: values.fulfillment_details || null,
+    fulfillment_notes: values.fulfillment_notes || null,
+    internal_notes: values.internal_notes || null,
+    order_adjustment: values.order_adjustment || "0",
+    adjustment_description: values.adjustment_description || null,
+    manual_tax: values.manual_tax || "0",
+    lines: values.lines.map(toLineInput),
   };
 }
 
@@ -233,6 +277,30 @@ export function OrderEntryPage() {
   const orderAdjustment = useWatch({ control, name: "order_adjustment" });
   const manualTax = useWatch({ control, name: "manual_tax" });
 
+  // Operational Impact Preview (Finding 2) — the whole form, watched reactively so a
+  // debounced snapshot can drive a real server call. Debounced (400ms) rather than
+  // firing on every keystroke. Serialized to a plain string OUTSIDE the effect so
+  // the effect's own dependency is a simple, staticly-checkable value rather than a
+  // complex inline expression.
+  const watchedValues = useWatch({ control });
+  const previewPayloadKey = JSON.stringify(buildPreviewPayload(watchedValues as FormValues));
+  const [debouncedPreviewKey, setDebouncedPreviewKey] = useState<string | null>(null);
+  useEffect(() => {
+    const handle = setTimeout(() => setDebouncedPreviewKey(previewPayloadKey), 400);
+    return () => clearTimeout(handle);
+  }, [previewPayloadKey]);
+
+  const previewQuery = useQuery({
+    queryKey: ["orders", "preview", isEdit ? id : "new", debouncedPreviewKey],
+    queryFn: () => {
+      const payload = JSON.parse(debouncedPreviewKey as string) as OrderCreateRequest;
+      return isEdit
+        ? ordersApi.previewExisting(id as string, payload)
+        : ordersApi.preview(payload);
+    },
+    enabled: Boolean(debouncedPreviewKey) && (!isEdit || Boolean(existingQuery.data)),
+  });
+
   // Carried-forward reference display (Final Hardening §2 / ADR-108) — a Draft's
   // customer_id can point at a Customer that has since become inactive; the active-only
   // list above would silently exclude it, and without this the trigger has nothing to
@@ -322,7 +390,13 @@ export function OrderEntryPage() {
   });
 
   const mutation = useMutation({
-    mutationFn: (values: FormValues) => {
+    mutationFn: ({
+      values,
+      fingerprints,
+    }: {
+      values: FormValues;
+      fingerprints: string[];
+    }) => {
       const lines = values.lines.map(toLineInput);
       if (isEdit) {
         if (!existingQuery.data) {
@@ -342,6 +416,9 @@ export function OrderEntryPage() {
           manual_tax: values.manual_tax || "0",
           lines,
           confirm_overpayment: values.confirm_overpayment ?? false,
+          // Harmless/ignored by the backend for a DRAFT edit — only meaningful
+          // when `existingQuery.data.status === "CONFIRMED"` (Finding 1).
+          acknowledged_warning_fingerprints: fingerprints,
         });
       }
       return ordersApi.create({
@@ -374,7 +451,16 @@ export function OrderEntryPage() {
     },
   });
 
-  const submit = handleSubmit((values) => mutation.mutate(values));
+  // The last successfully-validated form values submitted, so "Save anyway" (after
+  // an operational-warning rejection) can resubmit the identical proposed state plus
+  // the reviewed fingerprints, without asking the seller to re-trigger validation.
+  // State, not a ref — mutating a ref inside a handleSubmit-constructed callback
+  // trips the React Compiler's "ref accessed during render" heuristic.
+  const [lastSubmittedValues, setLastSubmittedValues] = useState<FormValues | null>(null);
+  const submit = handleSubmit((values) => {
+    setLastSubmittedValues(values);
+    mutation.mutate({ values, fingerprints: [] });
+  });
 
   const isStaleVersion =
     mutation.error instanceof ApiError && mutation.error.body?.error.code === "STALE_VERSION";
@@ -382,6 +468,20 @@ export function OrderEntryPage() {
     mutation.error instanceof ApiError
       ? mutation.error.body?.error.issues.find((i) => i.code === "PAYMENT_WOULD_OVERPAY")
       : undefined;
+  // Confirmed-Order demand-affecting edit, operational warnings unacknowledged
+  // (Finding 1; same fingerprint protocol OrderDetailPage's Confirm action uses).
+  const editWarningIssues =
+    mutation.error instanceof ApiError &&
+    mutation.error.body?.error.code === "OPERATIONAL_WARNINGS_REQUIRE_ACKNOWLEDGEMENT"
+      ? mutation.error.body.error.issues
+      : undefined;
+  const handleSaveAnyway = () => {
+    if (!lastSubmittedValues) return;
+    const fingerprints = (editWarningIssues ?? [])
+      .map((issue) => issue.details.fingerprint)
+      .filter((f): f is string => typeof f === "string");
+    mutation.mutate({ values: lastSubmittedValues, fingerprints });
+  };
 
   const handleRefreshAfterStaleVersion = async () => {
     mutation.reset();
@@ -424,6 +524,17 @@ export function OrderEntryPage() {
   const taxPreview = Number(manualTax || 0);
   const finalTotalPreview = subtotalPreview + adjustmentPreview + taxPreview;
   const products = productsQuery.data?.items ?? [];
+  const productNameById = new Map(products.map((p) => [p.id, p.name] as const));
+
+  // Final Architecture Lock §C: Edit stays accessible for a production-locked
+  // CONFIRMED order; only its operational fields (quantity, Product/source, date,
+  // time) may be conservatively grayed out — the backend independently and
+  // authoritatively re-enforces this at its own fine grain regardless of what this
+  // client-side flag does. Coarser-than-backend graying (the whole Items section +
+  // fulfillment date/time, rather than per-field) is explicitly permitted "for UX
+  // simplicity."
+  const operationalFieldsLocked =
+    isEdit && existingQuery.data?.status === "CONFIRMED" && existingQuery.data.production_locked;
 
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_320px]">
@@ -521,14 +632,34 @@ export function OrderEntryPage() {
         {/* --- Fulfillment --- */}
         <section className="flex flex-col gap-3">
           <h2 className="text-lg font-semibold">Fulfillment</h2>
-          <div className="grid grid-cols-2 gap-3">
+          {operationalFieldsLocked && (
+            <p className="rounded-md border border-amber-500/50 bg-amber-500/10 p-2 text-xs text-amber-700">
+              Demand is covered by an active production run — the date and time
+              below are read-only here.
+            </p>
+          )}
+          {/* fulfillment_date/time are the only Order-header fields that are
+              demand-affecting (Plan v2 §11) — method/details/notes are logistics
+              metadata and stay editable regardless of production_locked. */}
+          <fieldset
+            disabled={operationalFieldsLocked}
+            className="grid grid-cols-2 gap-3"
+          >
             <FormField id="fulfillment_date" label="Fulfillment date">
-              <Input id="fulfillment_date" type="date" {...register("fulfillment_date")} />
+              <Input
+                id="fulfillment_date"
+                type="date"
+                {...register("fulfillment_date")}
+              />
             </FormField>
             <FormField id="fulfillment_time" label="Fulfillment time">
-              <Input id="fulfillment_time" type="time" {...register("fulfillment_time")} />
+              <Input
+                id="fulfillment_time"
+                type="time"
+                {...register("fulfillment_time")}
+              />
             </FormField>
-          </div>
+          </fieldset>
           <Select
             value={fulfillmentMethod || ""}
             onValueChange={(value) => setValue("fulfillment_method", value ?? "", { shouldDirty: true })}
@@ -553,51 +684,68 @@ export function OrderEntryPage() {
         {/* --- Order Items --- */}
         <section className="flex flex-col gap-3">
           <h2 className="text-lg font-semibold">Order Items</h2>
-          {fields.map((field, index) => {
-            const lineErrors = errors.lines?.[index];
-            const errorMessage = lineErrors
-              ? Object.values(lineErrors)
-                  .map((e) => (e && typeof e === "object" && "message" in e ? e.message : undefined))
-                  .find((m): m is string => Boolean(m))
-              : undefined;
-            return (
-              <OrderLineRow
-                key={field.rhfKey}
-                control={control}
-                index={index}
-                register={register}
-                setValue={setValue}
-                remove={remove}
-                products={products}
-                errorMessage={errorMessage}
-              />
-            );
-          })}
-          <div className="flex gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => append(emptyLine("STANDARD_OPTION"))}
-            >
-              Add Standard Option line
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => append(emptyLine("CUSTOM_QUANTITY"))}
-            >
-              Add Custom Quantity line
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => append(emptyLine("CUSTOM_ITEM"))}
-            >
-              Add Custom Item line
-            </Button>
+          {operationalFieldsLocked && (
+            <p className="rounded-md border border-amber-500/50 bg-amber-500/10 p-2 text-xs text-amber-700">
+              Demand is covered by an active production run — product, selling option, and quantity
+              are read-only on the affected line(s) until that run completes or is canceled. Price,
+              packaging cost, and notes remain editable.
+            </p>
+          )}
+          <div className="flex flex-col gap-2">
+            {fields.map((field, index) => {
+              const lineErrors = errors.lines?.[index];
+              const errorMessage = lineErrors
+                ? Object.values(lineErrors)
+                    .map((e) =>
+                      e && typeof e === "object" && "message" in e
+                        ? e.message
+                        : undefined,
+                    )
+                    .find((m): m is string => Boolean(m))
+                : undefined;
+              return (
+                <OrderLineRow
+                  key={field.rhfKey}
+                  control={control}
+                  index={index}
+                  register={register}
+                  setValue={setValue}
+                  remove={remove}
+                  products={products}
+                  errorMessage={errorMessage}
+                  operationalDisabled={operationalFieldsLocked}
+                />
+              );
+            })}
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => append(emptyLine("STANDARD_OPTION"))}
+                disabled={operationalFieldsLocked}
+              >
+                Add Standard Option line
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => append(emptyLine("CUSTOM_QUANTITY"))}
+                disabled={operationalFieldsLocked}
+              >
+                Add Custom Quantity line
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => append(emptyLine("CUSTOM_ITEM"))}
+                disabled={operationalFieldsLocked}
+              >
+                Add Custom Item line
+              </Button>
+            </div>
           </div>
         </section>
 
@@ -657,9 +805,30 @@ export function OrderEntryPage() {
           </div>
         )}
 
+        {editWarningIssues && (
+          <div className="flex flex-col gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-sm">
+            <p className="font-semibold">Review before saving</p>
+            <ul className="list-inside list-disc">
+              {editWarningIssues.map((issue, index) => (
+                <li key={`${issue.code}-${index}`} role="alert">
+                  {issue.message}
+                </li>
+              ))}
+            </ul>
+            <Button
+              type="button"
+              size="sm"
+              onClick={handleSaveAnyway}
+              disabled={mutation.isPending}
+            >
+              Save anyway
+            </Button>
+          </div>
+        )}
+
         {isStaleVersion && <StaleVersionPanel onRefresh={handleRefreshAfterStaleVersion} />}
 
-        {mutation.isError && !isStaleVersion && !overpaymentIssue && (
+        {mutation.isError && !isStaleVersion && !overpaymentIssue && !editWarningIssues && (
           <p role="alert" className="text-sm text-destructive">
             {mutation.error instanceof ApiError
               ? mutation.error.body?.error.message
@@ -713,9 +882,150 @@ export function OrderEntryPage() {
           <p>Not yet calculated — available in a future phase.</p>
         </div>
 
-        <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-          <h2 className="mb-1 font-semibold">Operational Impact Preview</h2>
-          <p>Not yet available — coming in a future phase.</p>
+        <div className="rounded-md border p-4 text-sm">
+          <h2 className="mb-2 font-semibold">Operational Impact Preview</h2>
+          {previewQuery.isLoading && (
+            <p className="text-muted-foreground">Calculating…</p>
+          )}
+          {previewQuery.isError && (
+            <p role="alert" className="text-destructive">
+              Could not calculate operational impact.
+            </p>
+          )}
+          {previewQuery.data && (
+            <div className="flex flex-col gap-3">
+              {previewQuery.data.warnings.length > 0 && (
+                <ul className="list-inside list-disc rounded-md border border-amber-500/50 bg-amber-500/10 p-2 text-amber-700">
+                  {previewQuery.data.warnings.map((w, i) => (
+                    <li key={`${w.code}-${i}`}>{w.message}</li>
+                  ))}
+                </ul>
+              )}
+
+              {previewQuery.data.fulfillment_date_required_for_operational_preview && (
+                <p className="text-muted-foreground">
+                  Add a fulfillment date to see operational impact.
+                </p>
+              )}
+
+              {!previewQuery.data.fulfillment_date_required_for_operational_preview &&
+                previewQuery.data.production_requirements.length === 0 &&
+                previewQuery.data.ingredient_availability.length === 0 &&
+                previewQuery.data.purchased_shortages.length === 0 &&
+                previewQuery.data.custom_item_workload.length === 0 &&
+                previewQuery.data.warnings.length === 0 && (
+                  <p className="text-muted-foreground">
+                    No production impact yet — add a Standard Option or Custom
+                    Quantity line to see one.
+                  </p>
+                )}
+
+              {previewQuery.data.production_requirements.map((item, i) => (
+                <div
+                  key={`${item.product_id}-${item.recipe_revision_id}-${item.demand_date}-${i}`}
+                  className="rounded-md border p-2"
+                >
+                  <p className="font-medium">
+                    {productNameById.get(item.product_id) ?? "Product"} — {item.demand_date}
+                    {item.missing_recipe && (
+                      <span className="ml-2 text-xs text-amber-700">(no recipe)</span>
+                    )}
+                    {item.is_protected && (
+                      <span className="ml-2 text-xs text-muted-foreground">
+                        (in active production)
+                      </span>
+                    )}
+                  </p>
+                  <dl className="mt-1 grid grid-cols-3 gap-x-2 gap-y-0.5 text-xs">
+                    <dt className="text-muted-foreground">Existing (before this order)</dt>
+                    <dd className="col-span-2">
+                      {formatQuantityForDisplay(item.baseline_confirmed_demand_quantity)} demand,{" "}
+                      {formatQuantityForDisplay(item.baseline_production_demand_quantity)} to
+                      produce
+                      {item.baseline_recommended_batches != null &&
+                        ` (${item.baseline_recommended_batches} batches)`}
+                    </dd>
+                    <dt className="text-muted-foreground">After this order</dt>
+                    <dd className="col-span-2">
+                      {formatQuantityForDisplay(item.projected_confirmed_demand_quantity)} demand,{" "}
+                      {formatQuantityForDisplay(item.projected_production_demand_quantity)} to
+                      produce
+                      {item.projected_recommended_batches != null &&
+                        ` (${item.projected_recommended_batches} batches)`}
+                    </dd>
+                    <dt className="text-muted-foreground">This order's own contribution</dt>
+                    <dd className="col-span-2 font-medium">
+                      +{formatQuantityForDisplay(item.incremental_confirmed_demand_quantity)}{" "}
+                      demand, +
+                      {formatQuantityForDisplay(item.incremental_production_demand_quantity)} to
+                      produce
+                    </dd>
+                    {item.projected_suggested_start_at && (
+                      <>
+                        <dt className="text-muted-foreground">Suggested start</dt>
+                        <dd className="col-span-2">
+                          {new Date(item.projected_suggested_start_at).toLocaleString()}
+                        </dd>
+                      </>
+                    )}
+                  </dl>
+                </div>
+              ))}
+
+              {previewQuery.data.ingredient_availability.length > 0 && (
+                <div>
+                  <p className="mb-1 text-xs font-semibold text-muted-foreground">
+                    Ingredient availability
+                  </p>
+                  <ul className="flex flex-col gap-0.5 text-xs">
+                    {previewQuery.data.ingredient_availability.map((a) => (
+                      <li key={a.ingredient_id}>
+                        {a.ingredient_name} ({a.canonical_unit}): stock{" "}
+                        {formatQuantityForDisplay(a.physical_quantity)} — shortage{" "}
+                        {formatQuantityForDisplay(a.baseline_shortage_quantity)} →{" "}
+                        {formatQuantityForDisplay(a.projected_shortage_quantity)}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {previewQuery.data.purchased_shortages.length > 0 && (
+                <div>
+                  <p className="mb-1 text-xs font-semibold text-muted-foreground">
+                    Purchased stock shortage
+                  </p>
+                  <ul className="flex flex-col gap-0.5 text-xs">
+                    {previewQuery.data.purchased_shortages.map((s) => (
+                      <li key={s.product_id}>
+                        {productNameById.get(s.product_id) ?? "Product"}:
+                        shortage {formatQuantityForDisplay(s.baseline_shortage_quantity)} →{" "}
+                        {formatQuantityForDisplay(s.projected_shortage_quantity)}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {previewQuery.data.custom_item_workload.length > 0 && (
+                <div>
+                  <p className="mb-1 text-xs font-semibold text-muted-foreground">
+                    Manual/custom workload (not automated)
+                  </p>
+                  <ul className="flex flex-col gap-0.5 text-xs">
+                    {previewQuery.data.custom_item_workload.map((c, i) => (
+                      <li key={`${c.demand_date}-${i}`}>
+                        {c.demand_date}: {c.baseline_total_active_minutes} →{" "}
+                        {c.projected_total_active_minutes} min across{" "}
+                        {c.baseline_contributing_line_count} →{" "}
+                        {c.projected_contributing_line_count} item(s)
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </aside>
 

@@ -72,6 +72,9 @@ export interface Order {
   overpayment_amount: string | null;
   is_confirmable: boolean;
   confirmation_issues: ConfirmationIssue[];
+  // Phase 7: derived, non-persisted, read-time-only — advisory for UI gating.
+  // Never trusted for correctness; every write path re-checks authoritatively.
+  production_locked: boolean;
 }
 
 export interface OrderSummary {
@@ -136,6 +139,11 @@ export interface OrderCreateRequest extends OrderHeaderInput {
 export interface OrderUpdateRequest extends OrderHeaderInput {
   version: number;
   confirm_overpayment?: boolean;
+  // Phase 7 (Implementation Remediation Plan, Finding 1) — only meaningful (and
+  // only required) when editing a CONFIRMED order via the same PATCH endpoint: the
+  // exact fingerprint set reviewed on the preceding Preview call. Harmlessly
+  // ignored by the backend for a DRAFT edit.
+  acknowledged_warning_fingerprints?: string[];
 }
 
 export interface OrderListParams {
@@ -144,6 +152,91 @@ export interface OrderListParams {
   customer_id?: string;
   limit?: number;
   offset?: number;
+}
+
+// --- Phase 7: Confirm/Cancel/Preview ---------------------------------------------
+
+export interface OrderConfirmRequest {
+  version: number;
+  acknowledged_warning_fingerprints: string[];
+}
+
+export interface OrderCancelRequest {
+  version: number;
+}
+
+export interface OperationalWarning {
+  severity: string;
+  code: string;
+  message: string;
+  field: string | null;
+  resource: string;
+  details: Record<string, unknown>;
+}
+
+// Phase 7 Implementation Remediation Plan, Finding 2 (amendment 2): every group
+// below distinguishes the existing authoritative BASELINE (excluding the Order
+// being previewed) from the PROJECTED "after" picture and the server-computed
+// INCREMENTAL delta — never reconstructed client-side.
+export interface ProductionRequirementPreviewItem {
+  product_id: string;
+  recipe_revision_id: string | null;
+  demand_date: string;
+  is_protected: boolean;
+  missing_recipe: boolean;
+  baseline_confirmed_demand_quantity: string;
+  baseline_surplus_allocated_quantity: string;
+  baseline_production_demand_quantity: string;
+  baseline_recommended_batches: number | null;
+  projected_confirmed_demand_quantity: string;
+  projected_surplus_allocated_quantity: string;
+  projected_production_demand_quantity: string;
+  projected_recommended_batches: number | null;
+  projected_expected_output_quantity: string | null;
+  projected_expected_excess_quantity: string | null;
+  projected_estimated_active_minutes: number | null;
+  projected_estimated_elapsed_minutes: number | null;
+  projected_estimated_ingredient_cost: string | null;
+  projected_estimated_labor_cost: string | null;
+  projected_estimated_direct_production_cost: string | null;
+  projected_suggested_start_at: string | null;
+  incremental_confirmed_demand_quantity: string;
+  incremental_production_demand_quantity: string;
+}
+
+export interface IngredientAvailabilityPreviewItem {
+  ingredient_id: string;
+  ingredient_name: string;
+  canonical_unit: string;
+  physical_quantity: string;
+  baseline_shortage_quantity: string;
+  projected_shortage_quantity: string;
+}
+
+export interface PurchasedShortagePreviewItem {
+  product_id: string;
+  baseline_shortage_quantity: string;
+  projected_shortage_quantity: string;
+}
+
+export interface CustomItemWorkloadPreviewItem {
+  demand_date: string;
+  baseline_total_active_minutes: number;
+  projected_total_active_minutes: number;
+  baseline_contributing_line_count: number;
+  projected_contributing_line_count: number;
+}
+
+export interface OperationalPreviewResponse {
+  subtotal: string;
+  final_total: string;
+  warnings: OperationalWarning[];
+  warning_fingerprints: string[];
+  production_requirements: ProductionRequirementPreviewItem[];
+  ingredient_availability: IngredientAvailabilityPreviewItem[];
+  purchased_shortages: PurchasedShortagePreviewItem[];
+  custom_item_workload: CustomItemWorkloadPreviewItem[];
+  fulfillment_date_required_for_operational_preview: boolean;
 }
 
 function buildQuery(params: object): string {
@@ -179,4 +272,12 @@ export const ordersApi = {
     ),
   addPayment: (id: string, payload: PaymentInput) =>
     post<Order>(`/api/v1/orders/${id}/payments`, payload),
+  confirm: (id: string, payload: OrderConfirmRequest) =>
+    post<Order>(`/api/v1/orders/${id}/confirm`, payload),
+  cancel: (id: string, payload: OrderCancelRequest) =>
+    post<Order>(`/api/v1/orders/${id}/cancel`, payload),
+  preview: (payload: OrderCreateRequest) =>
+    post<OperationalPreviewResponse>("/api/v1/orders/preview", payload),
+  previewExisting: (id: string, payload: OrderCreateRequest) =>
+    post<OperationalPreviewResponse>(`/api/v1/orders/${id}/preview`, payload),
 };

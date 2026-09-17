@@ -9,7 +9,9 @@ for both a brand-new (possibly empty) Product and an existing one alike.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, date, datetime
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
@@ -42,6 +44,13 @@ from app.schemas.recipe import (
 from app.services import product_service, recipe_service
 
 router = APIRouter()
+
+
+def _business_today(business: Business) -> date:
+    """Business-local "today" (Final Pre-Implementation Amendment §2) — the single
+    derivation point for every "today" comparison a Phase 7 recalculation performs,
+    including one triggered by a Recipe migration."""
+    return datetime.now(UTC).astimezone(ZoneInfo(business.timezone)).date()
 
 
 def _selling_option_to_response(option: SellingOption) -> SellingOptionResponse:
@@ -322,7 +331,9 @@ def create_recipe(
     business: Annotated[Business, Depends(get_current_business)],
     db: Annotated[Session, Depends(get_db)],
 ) -> RecipeResponse:
-    recipe, revision = recipe_service.create_recipe(db, business, product_id, payload)
+    recipe, revision = recipe_service.create_recipe_with_impact(
+        db, business, product_id, payload, business_today=_business_today(business)
+    )
     return _recipe_to_response(recipe, revision)
 
 
@@ -378,5 +389,7 @@ def create_recipe_revision(
     business: Annotated[Business, Depends(get_current_business)],
     db: Annotated[Session, Depends(get_db)],
 ) -> RecipeRevisionResponse:
-    revision = recipe_service.create_recipe_revision(db, business, product_id, payload)
+    revision = recipe_service.create_recipe_revision_with_impact(
+        db, business, product_id, payload, business_today=_business_today(business)
+    )
     return _revision_to_response(revision)

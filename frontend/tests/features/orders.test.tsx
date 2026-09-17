@@ -1440,6 +1440,510 @@ describe("Order Edit — stale-version recovery", () => {
   });
 });
 
+describe("Order Entry — confirmed-edit operational warning review (Finding 8)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("shows the warning review and 'Save anyway' resubmits with the acknowledged fingerprint", async () => {
+    let patchCallCount = 0;
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, CONFIRMED_ORDER),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/customers\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\/p1$/,
+        respond: () => jsonResponse(200, PRODUCT_WITH_OPTION),
+      },
+      {
+        method: "PATCH",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: (_url, init) => {
+          patchCallCount += 1;
+          const body = JSON.parse(init?.body as string);
+          if ((body.acknowledged_warning_fingerprints ?? []).length === 0) {
+            return jsonResponse(422, {
+              error: {
+                code: "OPERATIONAL_WARNINGS_REQUIRE_ACKNOWLEDGEMENT",
+                message: "This order has operational warnings that must be reviewed before saving.",
+                issues: [
+                  {
+                    severity: "WARNING",
+                    code: "INGREDIENT_SHORTAGE",
+                    message: "There is not enough of this ingredient to cover demand.",
+                    field: null,
+                    resource: "ingredient",
+                    details: { fingerprint: "INGREDIENT_SHORTAGE:ing1:5.000000" },
+                  },
+                ],
+              },
+            });
+          }
+          return jsonResponse(200, { ...CONFIRMED_ORDER, version: CONFIRMED_ORDER.version + 1 });
+        },
+      },
+    ]);
+
+    renderAt("/app/orders/o1/edit");
+    await screen.findByRole("heading", { name: /edit order/i });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    });
+
+    expect(
+      await screen.findByText(/not enough of this ingredient to cover demand/i),
+    ).toBeInTheDocument();
+    const saveAnyway = screen.getByRole("button", { name: /save anyway/i });
+
+    await act(async () => {
+      fireEvent.click(saveAnyway);
+    });
+
+    await waitFor(() => expect(patchCallCount).toBe(2));
+  });
+});
+
+describe("Order Entry — Operational Impact Preview panel (Finding 8)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const PREVIEW_RESPONSE = {
+    subtotal: "60.00",
+    final_total: "60.00",
+    warnings: [
+      {
+        severity: "WARNING",
+        code: "INGREDIENT_SHORTAGE",
+        message: "There is not enough of this ingredient to cover demand.",
+        field: null,
+        resource: "ingredient",
+        details: { fingerprint: "INGREDIENT_SHORTAGE:ing1:20.000000" },
+      },
+    ],
+    warning_fingerprints: ["INGREDIENT_SHORTAGE:ing1:20.000000"],
+    production_requirements: [
+      {
+        product_id: "p1",
+        recipe_revision_id: "rev1",
+        demand_date: "2026-02-01",
+        is_protected: false,
+        missing_recipe: false,
+        baseline_confirmed_demand_quantity: "0.000000",
+        baseline_surplus_allocated_quantity: "0.000000",
+        baseline_production_demand_quantity: "0.000000",
+        baseline_recommended_batches: null,
+        projected_confirmed_demand_quantity: "6.000000",
+        projected_surplus_allocated_quantity: "0.000000",
+        projected_production_demand_quantity: "6.000000",
+        projected_recommended_batches: 1,
+        projected_expected_output_quantity: "12.000000",
+        projected_expected_excess_quantity: "6.000000",
+        projected_estimated_active_minutes: 30,
+        projected_estimated_elapsed_minutes: 30,
+        projected_estimated_ingredient_cost: "5.00",
+        projected_estimated_labor_cost: "7.50",
+        projected_estimated_direct_production_cost: "12.50",
+        projected_suggested_start_at: null,
+        incremental_confirmed_demand_quantity: "6.000000",
+        incremental_production_demand_quantity: "6.000000",
+      },
+    ],
+    ingredient_availability: [
+      {
+        ingredient_id: "ing1",
+        ingredient_name: "Test Flour",
+        canonical_unit: "g",
+        physical_quantity: "10.000000",
+        baseline_shortage_quantity: "0.000000",
+        projected_shortage_quantity: "20.000000",
+      },
+    ],
+    purchased_shortages: [],
+    custom_item_workload: [],
+  };
+
+  it("renders the server-computed baseline/projected production requirements and warnings for a new Order", async () => {
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/customers\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\?/,
+        respond: () =>
+          jsonResponse(200, { items: [PRODUCT_WITH_OPTION], total: 1, limit: 200, offset: 0 }),
+      },
+      {
+        method: "POST",
+        pattern: /\/api\/v1\/orders\/preview$/,
+        respond: () => jsonResponse(200, PREVIEW_RESPONSE),
+      },
+    ]);
+
+    renderAt("/app/orders/new");
+    await screen.findByRole("heading", { name: /new order/i });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /add custom quantity line/i }));
+    });
+    await openSelectAndPick(/line 1 product/i, /sourdough loaf/i);
+    fireEvent.change(screen.getByLabelText(/^quantity$/i), { target: { value: "6" } });
+    fireEvent.change(screen.getByLabelText(/agreed line price/i), { target: { value: "60.00" } });
+
+    expect(
+      await screen.findByText(/sourdough loaf.*2026-02-01/i, {}, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/not enough of this ingredient to cover demand/i),
+    ).toBeInTheDocument();
+    // Manual Acceptance UX Correction Plan, Finding 1/3: the Ingredient
+    // availability row identifies the Ingredient by name/unit and trims raw
+    // storage precision — never "stock 10.000000" with no identity.
+    expect(screen.getByText(/test flour \(g\): stock 10 —/i)).toBeInTheDocument();
+    expect(screen.queryByText(/10\.000000/i)).not.toBeInTheDocument();
+  });
+
+  it("renders the confirmed-order substitution preview (baseline excludes this Order's own contribution)", async () => {
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, CONFIRMED_ORDER),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/customers\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\/p1$/,
+        respond: () => jsonResponse(200, PRODUCT_WITH_OPTION),
+      },
+      {
+        method: "POST",
+        pattern: /\/api\/v1\/orders\/o1\/preview$/,
+        respond: () =>
+          jsonResponse(200, {
+            ...PREVIEW_RESPONSE,
+            production_requirements: [
+              {
+                ...PREVIEW_RESPONSE.production_requirements[0],
+                baseline_confirmed_demand_quantity: "4.000000", // sibling Order's own demand
+                projected_confirmed_demand_quantity: "16.000000", // 4 + this Order's 12
+                incremental_confirmed_demand_quantity: "12.000000", // never 16
+              },
+            ],
+          }),
+      },
+    ]);
+
+    renderAt("/app/orders/o1/edit");
+    await screen.findByRole("heading", { name: /edit order/i });
+
+    // Manual Acceptance UX Correction Plan, Finding 3: whole-number OIP
+    // quantities render trimmed of storage precision, never "4.000000 demand".
+    expect(await screen.findByText(/4 demand/i, {}, { timeout: 3000 })).toBeInTheDocument();
+    expect(screen.getByText(/16 demand/i)).toBeInTheDocument();
+    expect(screen.getByText(/\+12 demand/i)).toBeInTheDocument();
+    expect(screen.queryByText(/4\.000000 demand/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/16\.000000 demand/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/12\.000000 demand/i)).not.toBeInTheDocument();
+  });
+
+  it("shows the missing-fulfillment-date advisory instead of fabricating dated operational impact, while the financial preview stays available (Phase 7 Final Semantic & Precision Correction Plan, Finding 5)", async () => {
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/customers\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\?/,
+        respond: () =>
+          jsonResponse(200, { items: [PRODUCT_WITH_OPTION], total: 1, limit: 200, offset: 0 }),
+      },
+      {
+        method: "POST",
+        pattern: /\/api\/v1\/orders\/preview$/,
+        respond: () =>
+          jsonResponse(200, {
+            ...PREVIEW_RESPONSE,
+            warnings: [],
+            warning_fingerprints: [],
+            production_requirements: [],
+            ingredient_availability: [],
+            fulfillment_date_required_for_operational_preview: true,
+          }),
+      },
+    ]);
+
+    renderAt("/app/orders/new");
+    await screen.findByRole("heading", { name: /new order/i });
+
+    // Deliberately never touches the "Fulfillment date" field.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /add custom quantity line/i }));
+    });
+    await openSelectAndPick(/line 1 product/i, /sourdough loaf/i);
+    fireEvent.change(screen.getByLabelText(/^quantity$/i), { target: { value: "6" } });
+    fireEvent.change(screen.getByLabelText(/agreed line price/i), { target: { value: "60.00" } });
+
+    expect(
+      await screen.findByText(/add a fulfillment date to see operational impact/i, {}, {
+        timeout: 3000,
+      }),
+    ).toBeInTheDocument();
+
+    // No fabricated dated production/workload result is rendered.
+    expect(screen.queryByText(/sourdough loaf.*2026-\d\d-\d\d/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/no production impact yet — add a standard option/i),
+    ).not.toBeInTheDocument();
+
+    // Financial subtotal/final total remain available (computed client-side from
+    // the line values, independent of the backend preview's operational fields).
+    expect(getPreviewTotalText()).toBe("$60.00");
+  });
+
+  it("shows Custom Item manual workload without the contradictory 'no production impact yet' empty state (Manual Acceptance UX Correction Plan, Finding 4)", async () => {
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, CONFIRMED_ORDER),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/customers\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\/p1$/,
+        respond: () => jsonResponse(200, PRODUCT_WITH_OPTION),
+      },
+      {
+        method: "POST",
+        pattern: /\/api\/v1\/orders\/o1\/preview$/,
+        respond: () =>
+          jsonResponse(200, {
+            ...PREVIEW_RESPONSE,
+            warnings: [],
+            warning_fingerprints: [],
+            production_requirements: [],
+            ingredient_availability: [],
+            purchased_shortages: [],
+            custom_item_workload: [
+              {
+                demand_date: "2026-02-01",
+                baseline_total_active_minutes: 0,
+                projected_total_active_minutes: 45,
+                baseline_contributing_line_count: 0,
+                projected_contributing_line_count: 1,
+              },
+            ],
+          }),
+      },
+    ]);
+
+    renderAt("/app/orders/o1/edit");
+    await screen.findByRole("heading", { name: /edit order/i });
+
+    expect(
+      await screen.findByText(/manual\/custom workload/i, {}, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/no production impact yet/i)).not.toBeInTheDocument();
+  });
+
+  it("shows Purchased stock shortage without the contradictory 'no production impact yet' empty state (Manual Acceptance UX Correction Plan, Finding 4)", async () => {
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, CONFIRMED_ORDER),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/customers\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\/p1$/,
+        respond: () => jsonResponse(200, PRODUCT_WITH_OPTION),
+      },
+      {
+        method: "POST",
+        pattern: /\/api\/v1\/orders\/o1\/preview$/,
+        respond: () =>
+          jsonResponse(200, {
+            ...PREVIEW_RESPONSE,
+            warnings: [],
+            warning_fingerprints: [],
+            production_requirements: [],
+            ingredient_availability: [],
+            purchased_shortages: [
+              {
+                product_id: "p1",
+                baseline_shortage_quantity: "0.000000",
+                projected_shortage_quantity: "5.000000",
+              },
+            ],
+            custom_item_workload: [],
+          }),
+      },
+    ]);
+
+    renderAt("/app/orders/o1/edit");
+    await screen.findByRole("heading", { name: /edit order/i });
+
+    expect(
+      await screen.findByText(/purchased stock shortage/i, {}, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/no production impact yet/i)).not.toBeInTheDocument();
+  });
+
+  it("still shows the empty-state message when the Preview genuinely has no operational result at all", async () => {
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, CONFIRMED_ORDER),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/customers\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\/p1$/,
+        respond: () => jsonResponse(200, PRODUCT_WITH_OPTION),
+      },
+      {
+        method: "POST",
+        pattern: /\/api\/v1\/orders\/o1\/preview$/,
+        respond: () =>
+          jsonResponse(200, {
+            ...PREVIEW_RESPONSE,
+            warnings: [],
+            warning_fingerprints: [],
+            production_requirements: [],
+            ingredient_availability: [],
+            purchased_shortages: [],
+            custom_item_workload: [],
+          }),
+      },
+    ]);
+
+    renderAt("/app/orders/o1/edit");
+    await screen.findByRole("heading", { name: /edit order/i });
+
+    expect(
+      await screen.findByText(/no production impact yet/i, {}, { timeout: 3000 }),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("Order Entry — production-locked field-level granularity (Finding 8, depends on Finding 3)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("disables only demand-affecting controls on a production-locked line, leaving price/notes editable", async () => {
+    const LOCKED_ORDER = { ...CONFIRMED_ORDER, production_locked: true };
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, LOCKED_ORDER),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/customers\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\/p1$/,
+        respond: () => jsonResponse(200, PRODUCT_WITH_OPTION),
+      },
+    ]);
+
+    renderAt("/app/orders/o1/edit");
+    await screen.findByRole("heading", { name: /edit order/i });
+
+    // Demand-affecting controls: disabled.
+    expect(screen.getByRole("combobox", { name: "Line 1 type" })).toBeDisabled();
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Product" })).toBeDisabled());
+    expect(screen.getByRole("combobox", { name: "Selling option" })).toBeDisabled();
+    expect(screen.getByLabelText(/package quantity/i)).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Remove" })).toBeDisabled();
+
+    // Non-production fields: still editable.
+    const priceOverride = screen.getByLabelText(/price override/i);
+    expect(priceOverride).toBeEnabled();
+    fireEvent.change(priceOverride, { target: { value: "15.00" } });
+    expect(priceOverride).toHaveValue("15.00");
+
+    const notes = screen.getByLabelText(/line notes/i);
+    expect(notes).toBeEnabled();
+    fireEvent.change(notes, { target: { value: "seller note" } });
+    expect(notes).toHaveValue("seller note");
+
+    const reason = screen.getByLabelText(/override reason/i);
+    expect(reason).toBeEnabled();
+
+    // The fulfillment date/time fields are also locked (both genuinely
+    // operational together).
+    expect(screen.getByLabelText(/fulfillment date/i)).toBeDisabled();
+    expect(screen.getByLabelText(/fulfillment time/i)).toBeDisabled();
+
+    // Add-line buttons stay conservatively disabled as a whole.
+    expect(
+      screen.getByRole("button", { name: /add standard option line/i }),
+    ).toBeDisabled();
+  });
+});
+
 describe("Order Entry — unsaved-change navigation warning (correction 5)", () => {
   afterEach(() => vi.unstubAllGlobals());
 
@@ -1535,7 +2039,11 @@ describe("Order Detail", () => {
     expect(await screen.findByRole("heading", { name: /order not found/i })).toBeInTheDocument();
   });
 
-  it("renders lines, payment status, and typed structural readiness (no Confirm button)", async () => {
+  it("renders lines, payment status, and a disabled Confirm button when not structurally ready", async () => {
+    // Phase 7: the Confirm action now genuinely exists (Plan v2 §16) — this test is
+    // the documented, approved replacement for the old "no Confirm button" assertion
+    // (Plan v2 §19). It now proves the real, correct behavior for a structurally
+    // incomplete Draft: the button is present but disabled, never silently hidden.
     mockFetchRouter([
       {
         method: "GET",
@@ -1552,7 +2060,41 @@ describe("Order Detail", () => {
     expect(
       screen.getByText(/a fulfillment date is required before confirmation/i),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /confirm/i })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /confirm order/i }),
+    ).toBeDisabled();
+  });
+
+  it("renders line quantities trimmed of storage precision, not raw six-decimal strings (Manual Acceptance UX Correction Plan, Amendment 2)", async () => {
+    const customQuantityLine = {
+      ...ORDER_LINE,
+      id: "line-2",
+      line_type: "CUSTOM_QUANTITY",
+      selling_option_id: null,
+      display_name_snapshot: "Custom bulk flour",
+      package_quantity: "1.000000",
+      underlying_quantity: "1.250000",
+    };
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, { ...ORDER, lines: [ORDER_LINE, customQuantityLine] }),
+      },
+    ]);
+
+    renderAt("/app/orders/o1");
+    await screen.findByRole("heading", { name: "ORD-ABCDEF012345" });
+
+    // STANDARD_OPTION line: "2.000000" package_quantity must render as "2 pkg",
+    // never the raw "2.000000 pkg" the seller manually observed.
+    expect(screen.getByText("2 pkg")).toBeInTheDocument();
+    expect(screen.queryByText("2.000000 pkg")).not.toBeInTheDocument();
+
+    // CUSTOM_QUANTITY line: underlying_quantity renders trimmed, with meaningful
+    // fractional precision preserved.
+    expect(screen.getByText("1.25")).toBeInTheDocument();
+    expect(screen.queryByText("1.250000")).not.toBeInTheDocument();
   });
 
   it("shows the Draft-delete-with-payments warning and lets the seller delete anyway", async () => {
@@ -1610,6 +2152,199 @@ describe("Order Detail", () => {
     });
 
     await waitFor(() => expect(deleteCallCount).toBe(2));
+  });
+});
+
+const CONFIRMED_ORDER = {
+  ...ORDER,
+  status: "CONFIRMED",
+  fulfillment_date: "2026-02-01",
+  fulfillment_time: "09:00:00",
+  is_confirmable: false,
+  confirmation_issues: [],
+  production_locked: false,
+};
+
+describe("Order Detail — Phase 7 lifecycle actions (Finding 8)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("confirms a structurally-ready Draft order with no warnings", async () => {
+    let confirmCallCount = 0;
+    let confirmed = false;
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () =>
+          jsonResponse(
+            200,
+            confirmed
+              ? CONFIRMED_ORDER
+              : {
+                  ...ORDER,
+                  fulfillment_date: "2026-02-01",
+                  is_confirmable: true,
+                  confirmation_issues: [],
+                },
+          ),
+      },
+      {
+        method: "POST",
+        pattern: /\/api\/v1\/orders\/o1\/confirm$/,
+        respond: () => {
+          confirmCallCount += 1;
+          confirmed = true;
+          return jsonResponse(200, CONFIRMED_ORDER);
+        },
+      },
+    ]);
+
+    renderAt("/app/orders/o1");
+    await screen.findByRole("heading", { name: "ORD-ABCDEF012345" });
+
+    const confirmButton = await screen.findByRole("button", { name: "Confirm Order" });
+    expect(confirmButton).toBeEnabled();
+    await act(async () => {
+      fireEvent.click(confirmButton);
+    });
+
+    await waitFor(() => expect(confirmCallCount).toBe(1));
+    expect(await screen.findByRole("heading", { name: "Confirmed" })).toBeInTheDocument();
+  });
+
+  it("shows the operational warning review and resubmits with the acknowledged fingerprint", async () => {
+    let confirmCallCount = 0;
+    let confirmed = false;
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () =>
+          jsonResponse(
+            200,
+            confirmed
+              ? CONFIRMED_ORDER
+              : {
+                  ...ORDER,
+                  fulfillment_date: "2026-02-01",
+                  is_confirmable: true,
+                  confirmation_issues: [],
+                },
+          ),
+      },
+      {
+        method: "POST",
+        pattern: /\/api\/v1\/orders\/o1\/confirm$/,
+        respond: (_url, init) => {
+          confirmCallCount += 1;
+          const body = JSON.parse(init?.body as string);
+          if (body.acknowledged_warning_fingerprints.length === 0) {
+            return jsonResponse(422, {
+              error: {
+                code: "OPERATIONAL_WARNINGS_REQUIRE_ACKNOWLEDGEMENT",
+                message: "This order has operational warnings that must be reviewed.",
+                issues: [
+                  {
+                    severity: "WARNING",
+                    code: "INGREDIENT_SHORTAGE",
+                    message: "There is not enough of this ingredient to cover demand.",
+                    field: null,
+                    resource: "ingredient",
+                    details: { fingerprint: "INGREDIENT_SHORTAGE:ing1:20.000000" },
+                  },
+                ],
+              },
+            });
+          }
+          confirmed = true;
+          return jsonResponse(200, CONFIRMED_ORDER);
+        },
+      },
+    ]);
+
+    renderAt("/app/orders/o1");
+    await screen.findByRole("heading", { name: "ORD-ABCDEF012345" });
+
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Confirm Order" }));
+    });
+
+    expect(
+      await screen.findByText(/not enough of this ingredient to cover demand/i),
+    ).toBeInTheDocument();
+    const confirmAnyway = screen.getByRole("button", { name: /confirm anyway/i });
+
+    await act(async () => {
+      fireEvent.click(confirmAnyway);
+    });
+
+    await waitFor(() => expect(confirmCallCount).toBe(2));
+    expect(await screen.findByRole("heading", { name: "Confirmed" })).toBeInTheDocument();
+  });
+
+  it("cancels a Confirmed order via the confirmation dialog", async () => {
+    let cancelCallCount = 0;
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, CONFIRMED_ORDER),
+      },
+      {
+        method: "POST",
+        pattern: /\/api\/v1\/orders\/o1\/cancel$/,
+        respond: () => {
+          cancelCallCount += 1;
+          return jsonResponse(200, { ...CONFIRMED_ORDER, status: "CANCELED" });
+        },
+      },
+    ]);
+
+    renderAt("/app/orders/o1");
+    await screen.findByRole("heading", { name: "ORD-ABCDEF012345" });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel Order" }));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Cancel order" }));
+    });
+
+    await waitFor(() => expect(cancelCallCount).toBe(1));
+  });
+
+  it("shows an Edit link for a Confirmed order that navigates to the edit page", async () => {
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, CONFIRMED_ORDER),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/customers\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\?/,
+        respond: () => jsonResponse(200, { items: [], total: 0, limit: 200, offset: 0 }),
+      },
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/products\/p1$/,
+        respond: () => jsonResponse(200, PRODUCT_WITH_OPTION),
+      },
+    ]);
+
+    renderAt("/app/orders/o1");
+    await screen.findByRole("heading", { name: "ORD-ABCDEF012345" });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("link", { name: "Edit" }));
+    });
+
+    await screen.findByRole("heading", { name: /edit order/i });
   });
 });
 

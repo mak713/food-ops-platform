@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatDecimal } from "../../src/lib/decimal";
+import { formatDecimal, formatQuantityForDisplay } from "../../src/lib/decimal";
 
 describe("formatDecimal", () => {
   it("leaves an integer-looking value with no fractional part unchanged", () => {
@@ -29,5 +29,33 @@ describe("formatDecimal", () => {
 
   it("reduces an all-zero fractional value to its bare integer", () => {
     expect(formatDecimal("0.000000")).toBe("0");
+  });
+});
+
+describe("formatQuantityForDisplay", () => {
+  it("trims trailing storage-precision zeros off a whole number", () => {
+    expect(formatQuantityForDisplay("12.000000")).toBe("12");
+  });
+
+  it("preserves meaningful fractional digits", () => {
+    expect(formatQuantityForDisplay("1.250000")).toBe("1.25");
+  });
+
+  it("adds a thousands separator to a large whole-number quantity", () => {
+    expect(formatQuantityForDisplay("496000.000000")).toBe("496,000");
+  });
+
+  it("groups the integer part while preserving fractional digits together", () => {
+    expect(formatQuantityForDisplay("1234567.500000")).toBe("1,234,567.5");
+  });
+
+  it("does not group a value under 1000", () => {
+    expect(formatQuantityForDisplay("500.000000")).toBe("500");
+  });
+
+  it("never mutates the underlying numeric value, only its display form", () => {
+    // Confirms this is purely additive over formatDecimal's own trimming —
+    // the same value, unformatted, is what a request payload would still use.
+    expect(formatQuantityForDisplay("0.000000")).toBe("0");
   });
 });

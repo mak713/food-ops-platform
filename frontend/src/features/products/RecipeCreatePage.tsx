@@ -1,17 +1,43 @@
 // Recipe creation (Phase 4 Plan v4 §5/§13) — Recipe + Revision 1 + all ingredient lines
 // are created atomically in one request; there is no separate "create empty recipe" step.
+//
+// Phase 7 Implementation Remediation Plan, Finding 3: the initial submit omits
+// `apply_scope`. If the Product already has confirmed `INCOMPLETE_RECIPE` unstarted
+// demand, the backend responds with the structured `RECIPE_REVISION_IMPACT_REQUIRED`
+// (422) — this page opens the same "Apply Existing" / "Future Only" dialog
+// `RecipeEditPage` uses and resubmits with the chosen scope. Unlike a replacement
+// revision, first-Recipe creation has no `expected_current_revision_id` at all (Final
+// Pre-Implementation Amendment §5) — a concurrent-creation race is instead surfaced as
+// the existing `RECIPE_ALREADY_EXISTS` 409, not a new concurrency code.
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
-import { ApiError } from "../../api/client";
+import { ApiError, type ApiErrorIssue } from "../../api/client";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "../../components/ui/alert-dialog";
 import { ErrorBanner } from "../../components/shared/ErrorBanner";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { ingredientsApi } from "../ingredients/api";
 import { productsApi } from "./api";
-import { recipeApi, type RecipeContentInput } from "./recipeApi";
+import { recipeApi, type ApplyScope, type RecipeContentInput } from "./recipeApi";
 import { RecipeContentForm, type IngredientOption } from "./RecipeContentForm";
 import { useState } from "react";
+
+interface AffectedOrderLine {
+  order_id: string;
+  order_line_id: string;
+  product_id: string;
+  demand_date: string;
+}
 
 export function RecipeCreatePage() {
   const { id } = useParams<{ id: string }>();
@@ -20,6 +46,7 @@ export function RecipeCreatePage() {
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
   const [nameError, setNameError] = useState<string | null>(null);
+  const [pendingContent, setPendingContent] = useState<RecipeContentInput | null>(null);
 
   const productQuery = useQuery({
     queryKey: ["products", productId],
@@ -32,12 +59,31 @@ export function RecipeCreatePage() {
   });
 
   const mutation = useMutation({
-    mutationFn: (content: RecipeContentInput) => recipeApi.create(productId, { name, ...content }),
+    mutationFn: ({
+      content,
+      applyScope,
+    }: {
+      content: RecipeContentInput;
+      applyScope?: ApplyScope;
+    }) => recipeApi.create(productId, { name, apply_scope: applyScope, ...content }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["products", productId] });
       navigate(`/app/products/${productId}`);
     },
   });
+
+  const impactRequiredIssue: ApiErrorIssue | undefined =
+    mutation.error instanceof ApiError &&
+    mutation.error.body?.error.code === "RECIPE_REVISION_IMPACT_REQUIRED"
+      ? mutation.error.body.error.issues[0]
+      : undefined;
+  const affectedOrderLines = (impactRequiredIssue?.details.affected_order_lines ??
+    []) as AffectedOrderLine[];
+
+  const handleChooseScope = (applyScope: ApplyScope) => {
+    if (!pendingContent) return;
+    mutation.mutate({ content: pendingContent, applyScope });
+  };
 
   if (productQuery.isLoading || ingredientsQuery.isLoading) {
     return <p className="text-sm text-muted-foreground">Loading…</p>;
@@ -100,17 +146,49 @@ export function RecipeCreatePage() {
         activeIngredients={activeIngredients}
         ingredientLookup={ingredientLookup}
         isPending={mutation.isPending}
-        mutationError={mutation.error}
+        mutationError={impactRequiredIssue ? null : mutation.error}
         submitLabel="Create Recipe"
         onSubmit={(content) => {
           if (!name.trim()) {
             setNameError("Recipe name is required");
             return;
           }
-          mutation.mutate(content);
+          setPendingContent(content);
+          mutation.mutate({ content });
         }}
         onCancel={() => navigate(`/app/products/${productId}`)}
       />
+
+      <AlertDialog open={Boolean(impactRequiredIssue)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>This recipe affects confirmed orders</AlertDialogTitle>
+            <AlertDialogDescription>
+              {affectedOrderLines.length} confirmed order line
+              {affectedOrderLines.length === 1 ? "" : "s"} for this product currently have
+              no recipe. Choose how this first recipe should apply:
+              <br />
+              <strong>Apply Existing</strong> migrates that confirmed demand to this recipe
+              now. <strong>Future Only</strong> leaves it as-is — only newly confirmed
+              demand uses this recipe.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => mutation.reset()}>Cancel</AlertDialogCancel>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => handleChooseScope("future_only")}
+              disabled={mutation.isPending}
+            >
+              Future Only
+            </Button>
+            <AlertDialogAction onClick={() => handleChooseScope("apply_existing")}>
+              Apply Existing
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

@@ -23,6 +23,12 @@ interface ProductSellingOptionPickerProps {
   // while the live Product detail is loading — this is the line's own already-known
   // snapshot, never fabricated, so it's safe to show before the catalog fetch resolves.
   fallbackDisplayName?: string;
+  // Phase 7 Final Remediation Correction Plan, Finding 3 — a production-locked
+  // STANDARD_OPTION line's source (Product/Selling Option) must not be newly
+  // selectable, while non-production fields on the same line stay editable. Combined
+  // (via `||`) with each Select's own existing loading/empty-state disable logic
+  // below, never replacing it.
+  disabled?: boolean;
 }
 
 export function ProductSellingOptionPicker({
@@ -30,6 +36,7 @@ export function ProductSellingOptionPicker({
   sellingOptionId,
   onChange,
   fallbackDisplayName,
+  disabled = false,
 }: ProductSellingOptionPickerProps) {
   const productsQuery = useQuery({
     queryKey: ["products", { is_active: true, limit: 200 }],
@@ -162,7 +169,7 @@ export function ProductSellingOptionPicker({
           // is in flight for a normal, soon-to-resolve reason, and never disabled on an
           // error (the seller should still be able to see/retry, not be silently locked
           // out indistinguishably from "zero eligible").
-          disabled={productsIsLoading || productsHaveNoEligibleOptions}
+          disabled={disabled || productsIsLoading || productsHaveNoEligibleOptions}
         >
           <SelectTrigger aria-label="Product">
             {/* Render-prop, not a plain `placeholder` — an ineligible carried-forward
@@ -236,7 +243,9 @@ export function ProductSellingOptionPicker({
           // chosen under it — the seller must switch to an active Product first
           // (Final Hardening §2); the already-selected option (if any) stays
           // displayed above.
-          disabled={!productId || sellingOptions.length === 0 || currentProductIsInactive}
+          disabled={
+            disabled || !productId || sellingOptions.length === 0 || currentProductIsInactive
+          }
         >
           <SelectTrigger aria-label="Selling option">
             <SelectValue>

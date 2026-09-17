@@ -344,6 +344,68 @@ describe("Recipe creation — atomic Recipe + Revision 1", () => {
     await waitFor(() => expect(postCallCount).toBe(1));
   });
 
+  it("preserves an existing active ingredient line's unit (mL) when only its quantity is edited (Manual Acceptance UX Correction Plan, Finding 5 test-coverage gap)", async () => {
+    // Closes the test-coverage gap the Recipe unit-path audit identified: no
+    // existing test loaded an active line with unit "mL", edited only its
+    // quantity, and asserted the submitted unit was still "mL". The audit's
+    // full code-path trace (toFormValues -> Select -> submit mapping -> API ->
+    // backend schema/service) found no transformation possible; this test
+    // proves it end-to-end rather than by static reading alone.
+    const REVISION_WITH_ML_LINE = {
+      ...REVISION_1,
+      ingredients: [
+        {
+          id: "line1",
+          ingredient_id: "i2",
+          ingredient_name: "Water",
+          ingredient_is_active: true,
+          quantity: "500.000000",
+          unit: "mL",
+        },
+      ],
+    };
+    const RECIPE_WITH_ML_LINE = { ...RECIPE, current_revision: REVISION_WITH_ML_LINE };
+    let capturedBody: { ingredients?: { ingredient_id: string; quantity: string; unit: string }[] } | undefined;
+
+    vi.stubGlobal(
+      "fetch",
+      fetchRouterFor([
+        { method: "GET", pattern: /\/api\/v1\/products\/p1$/, respond: () => jsonResponse(200, PRODUCED_PRODUCT) },
+        {
+          method: "GET",
+          pattern: /\/api\/v1\/products\/p1\/recipe$/,
+          respond: () => jsonResponse(200, RECIPE_WITH_ML_LINE),
+        },
+        { method: "GET", pattern: /\/api\/v1\/ingredients\?/, respond: () => allActivePage([FLOUR, WATER]) },
+        {
+          method: "POST",
+          pattern: /\/api\/v1\/products\/p1\/recipe\/revisions$/,
+          respond: (_url, init) => {
+            capturedBody = JSON.parse(init!.body as string);
+            return jsonResponse(201, { ...REVISION_WITH_ML_LINE, id: "rev2", revision_number: 2 });
+          },
+        },
+      ]),
+    );
+
+    renderAt("/app/products/p1/recipe/edit");
+    await screen.findByRole("heading", { name: /edit recipe/i });
+    await screen.findByText("Water");
+
+    const line = screen.getByText("Water").closest("div.rounded-md") as HTMLElement;
+    expect(within(line).getByLabelText(/^unit$/i)).toHaveTextContent("mL");
+
+    // Edit ONLY the quantity — never touch the Ingredient or Unit selects.
+    fireEvent.change(within(line).getByLabelText(/^quantity$/i), { target: { value: "600" } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /save as new revision/i }));
+    });
+
+    await waitFor(() => expect(capturedBody).toBeDefined());
+    expect(capturedBody?.ingredients).toEqual([{ ingredient_id: "i2", quantity: "600", unit: "mL" }]);
+  });
+
   it("displays the selected Ingredient's human-readable name (never its raw ID) in the closed Select, while still submitting the ID", async () => {
     const UUID_INGREDIENT = {
       id: "a1b2c3d4-e5f6-47a8-b9c0-d1e2f3a4b5c6",
@@ -828,5 +890,237 @@ describe("Recipe editor — all-pages ingredient selector", () => {
     const line = screen.getByLabelText(/^quantity$/i).closest("div.rounded-md") as HTMLElement;
     fireEvent.click(within(line).getByLabelText(/^ingredient$/i));
     expect(screen.getByText("Vanilla Extract")).toBeInTheDocument();
+  });
+});
+
+// --- Phase 7 Final Remediation Correction Plan, Finding 8: impact-choice dialogs -------
+
+async function fillMinimalRecipeContent() {
+  fireEvent.change(screen.getByLabelText(/^yield$/i), { target: { value: "10" } });
+  fireEvent.change(screen.getByLabelText(/active time/i), { target: { value: "30" } });
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /add ingredient/i }));
+  });
+  const line = screen.getByLabelText(/^quantity$/i).closest("div.rounded-md") as HTMLElement;
+  fireEvent.change(within(line).getByLabelText(/^quantity$/i), { target: { value: "500" } });
+  selectOptionWithin(line, /^unit$/i, /g \(grams\)/);
+}
+
+const IMPACT_REQUIRED_ISSUE = {
+  severity: "WARNING",
+  code: "RECIPE_REVISION_IMPACT_REQUIRED",
+  message: "Confirmed demand exists for this recipe's current revision.",
+  field: "apply_scope",
+  resource: "recipe_revision",
+  details: {
+    options: ["apply_existing", "future_only"],
+    affected_order_lines: [
+      { order_id: "o1", order_line_id: "line1", product_id: "p1", demand_date: "2026-02-01" },
+    ],
+  },
+};
+
+describe("Recipe Create — impact-choice dialog (Finding 8)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("opens the dialog on RECIPE_REVISION_IMPACT_REQUIRED and resubmits with apply_scope='future_only'", async () => {
+    let capturedBody: { apply_scope?: string } | undefined;
+    let postCallCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      fetchRouterFor([
+        { method: "GET", pattern: /\/api\/v1\/products\/p1$/, respond: () => jsonResponse(200, PRODUCED_PRODUCT) },
+        { method: "GET", pattern: /\/api\/v1\/ingredients\?/, respond: () => allActivePage([FLOUR]) },
+        {
+          method: "POST",
+          pattern: /\/api\/v1\/products\/p1\/recipe$/,
+          respond: (_url, init) => {
+            postCallCount += 1;
+            capturedBody = JSON.parse(init!.body as string);
+            if (!capturedBody?.apply_scope) {
+              return jsonResponse(422, {
+                error: {
+                  code: "RECIPE_REVISION_IMPACT_REQUIRED",
+                  message: "This recipe has confirmed, unstarted demand that would be affected.",
+                  issues: [IMPACT_REQUIRED_ISSUE],
+                },
+              });
+            }
+            return jsonResponse(201, RECIPE);
+          },
+        },
+      ]),
+    );
+
+    renderAt("/app/products/p1/recipe/new");
+    await screen.findByRole("heading", { name: /create recipe/i });
+
+    fireEvent.change(screen.getByLabelText(/recipe name/i), { target: { value: "Classic Sourdough" } });
+    await fillMinimalRecipeContent();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /create recipe/i }));
+    });
+
+    expect(await screen.findByText(/this recipe affects confirmed orders/i)).toBeInTheDocument();
+    expect(screen.getByText(/1 confirmed order line/i)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^future only$/i }));
+    });
+
+    await waitFor(() => expect(postCallCount).toBe(2));
+    expect(capturedBody?.apply_scope).toBe("future_only");
+    expect(await screen.findByRole("heading", { name: "Sourdough Loaf" })).toBeInTheDocument();
+  });
+
+  it("resubmits with apply_scope='apply_existing' when that option is chosen", async () => {
+    let capturedBody: { apply_scope?: string } | undefined;
+    let postCallCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      fetchRouterFor([
+        { method: "GET", pattern: /\/api\/v1\/products\/p1$/, respond: () => jsonResponse(200, PRODUCED_PRODUCT) },
+        { method: "GET", pattern: /\/api\/v1\/ingredients\?/, respond: () => allActivePage([FLOUR]) },
+        {
+          method: "POST",
+          pattern: /\/api\/v1\/products\/p1\/recipe$/,
+          respond: (_url, init) => {
+            postCallCount += 1;
+            capturedBody = JSON.parse(init!.body as string);
+            if (!capturedBody?.apply_scope) {
+              return jsonResponse(422, {
+                error: {
+                  code: "RECIPE_REVISION_IMPACT_REQUIRED",
+                  message: "This recipe has confirmed, unstarted demand that would be affected.",
+                  issues: [IMPACT_REQUIRED_ISSUE],
+                },
+              });
+            }
+            return jsonResponse(201, RECIPE);
+          },
+        },
+      ]),
+    );
+
+    renderAt("/app/products/p1/recipe/new");
+    await screen.findByRole("heading", { name: /create recipe/i });
+
+    fireEvent.change(screen.getByLabelText(/recipe name/i), { target: { value: "Classic Sourdough" } });
+    await fillMinimalRecipeContent();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /create recipe/i }));
+    });
+
+    expect(await screen.findByText(/this recipe affects confirmed orders/i)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^apply existing$/i }));
+    });
+
+    await waitFor(() => expect(postCallCount).toBe(2));
+    expect(capturedBody?.apply_scope).toBe("apply_existing");
+    expect(await screen.findByRole("heading", { name: "Sourdough Loaf" })).toBeInTheDocument();
+  });
+});
+
+describe("Recipe Edit — impact-choice dialog (Finding 8)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("opens the dialog on RECIPE_REVISION_IMPACT_REQUIRED and resubmits with apply_scope='future_only'", async () => {
+    let capturedBody: { apply_scope?: string } | undefined;
+    let postCallCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      fetchRouterFor([
+        { method: "GET", pattern: /\/api\/v1\/products\/p1$/, respond: () => jsonResponse(200, PRODUCED_PRODUCT) },
+        { method: "GET", pattern: /\/api\/v1\/products\/p1\/recipe$/, respond: () => jsonResponse(200, RECIPE) },
+        { method: "GET", pattern: /\/api\/v1\/ingredients\?/, respond: () => allActivePage([FLOUR]) },
+        {
+          method: "POST",
+          pattern: /\/api\/v1\/products\/p1\/recipe\/revisions$/,
+          respond: (_url, init) => {
+            postCallCount += 1;
+            capturedBody = JSON.parse(init!.body as string);
+            if (!capturedBody?.apply_scope) {
+              return jsonResponse(422, {
+                error: {
+                  code: "RECIPE_REVISION_IMPACT_REQUIRED",
+                  message: "This recipe has confirmed, unstarted demand that would be affected.",
+                  issues: [IMPACT_REQUIRED_ISSUE],
+                },
+              });
+            }
+            return jsonResponse(201, { ...REVISION_1, id: "rev2", revision_number: 2 });
+          },
+        },
+      ]),
+    );
+
+    renderAt("/app/products/p1/recipe/edit");
+    await screen.findByRole("heading", { name: /edit recipe/i });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /save as new revision/i }));
+    });
+
+    expect(await screen.findByText(/this change affects confirmed orders/i)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^future only$/i }));
+    });
+
+    await waitFor(() => expect(postCallCount).toBe(2));
+    expect(capturedBody?.apply_scope).toBe("future_only");
+    expect(await screen.findByRole("heading", { name: "Sourdough Loaf" })).toBeInTheDocument();
+  });
+
+  it("resubmits with apply_scope='apply_existing' when that option is chosen", async () => {
+    let capturedBody: { apply_scope?: string } | undefined;
+    let postCallCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      fetchRouterFor([
+        { method: "GET", pattern: /\/api\/v1\/products\/p1$/, respond: () => jsonResponse(200, PRODUCED_PRODUCT) },
+        { method: "GET", pattern: /\/api\/v1\/products\/p1\/recipe$/, respond: () => jsonResponse(200, RECIPE) },
+        { method: "GET", pattern: /\/api\/v1\/ingredients\?/, respond: () => allActivePage([FLOUR]) },
+        {
+          method: "POST",
+          pattern: /\/api\/v1\/products\/p1\/recipe\/revisions$/,
+          respond: (_url, init) => {
+            postCallCount += 1;
+            capturedBody = JSON.parse(init!.body as string);
+            if (!capturedBody?.apply_scope) {
+              return jsonResponse(422, {
+                error: {
+                  code: "RECIPE_REVISION_IMPACT_REQUIRED",
+                  message: "This recipe has confirmed, unstarted demand that would be affected.",
+                  issues: [IMPACT_REQUIRED_ISSUE],
+                },
+              });
+            }
+            return jsonResponse(201, { ...REVISION_1, id: "rev2", revision_number: 2 });
+          },
+        },
+      ]),
+    );
+
+    renderAt("/app/products/p1/recipe/edit");
+    await screen.findByRole("heading", { name: /edit recipe/i });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /save as new revision/i }));
+    });
+
+    expect(await screen.findByText(/this change affects confirmed orders/i)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^apply existing$/i }));
+    });
+
+    await waitFor(() => expect(postCallCount).toBe(2));
+    expect(capturedBody?.apply_scope).toBe("apply_existing");
+    expect(await screen.findByRole("heading", { name: "Sourdough Loaf" })).toBeInTheDocument();
   });
 });

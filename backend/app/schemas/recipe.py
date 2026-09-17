@@ -14,8 +14,16 @@ from __future__ import annotations
 
 import uuid
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+#: Phase 7 Recipe-migration impact choice (Plan v2 §9, corrected by Final
+#: Pre-Implementation Amendment §7/§8): never defaulted — an absent value with
+#: affected confirmed unstarted demand present produces a structured
+#: `RECIPE_REVISION_IMPACT_REQUIRED` response with zero mutation, requiring the
+#: seller to resubmit with an explicit choice.
+ApplyScope = Literal["apply_existing", "future_only"]
 
 
 class RecipeRevisionIngredientCreateRequest(BaseModel):
@@ -67,6 +75,7 @@ class _RevisionContent(BaseModel):
 
 class RecipeCreateRequest(_RevisionContent):
     name: str = Field(min_length=1, max_length=200)
+    apply_scope: ApplyScope | None = None
 
     @field_validator("name")
     @classmethod
@@ -84,6 +93,25 @@ class RecipeRevisionCreateRequest(_RevisionContent):
     `409 RECIPE_REVISION_CONFLICT` with no write."""
 
     expected_current_revision_id: uuid.UUID
+    apply_scope: ApplyScope | None = None
+
+
+class RecipeRevisionAffectedOrderLine(BaseModel):
+    order_id: str
+    order_line_id: str
+    product_id: str
+    demand_date: str
+
+
+class RecipeRevisionImpactRequired(BaseModel):
+    """Phase 7 (Plan v2 §9, Final Pre-Implementation Amendment §8): returned instead
+    of creating anything when affected confirmed, unstarted demand exists and no
+    `apply_scope` was submitted. Zero mutation occurred — every lock this attempt
+    acquired has already been released by the time this is returned."""
+
+    code: str = "RECIPE_REVISION_IMPACT_REQUIRED"
+    affected_order_lines: list[RecipeRevisionAffectedOrderLine]
+    options: list[str] = Field(default_factory=lambda: ["apply_existing", "future_only"])
 
 
 class RecipeRenameRequest(BaseModel):

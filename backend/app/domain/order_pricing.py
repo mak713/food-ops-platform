@@ -277,25 +277,19 @@ class ConfirmationIssue:
     field: str | None = None
 
 
-def check_structural_confirmation_readiness(
-    *, status: str, line_count: int, fulfillment_date_present: bool
+def check_candidate_structural_readiness(
+    *, line_count: int, fulfillment_date_present: bool
 ) -> list[ConfirmationIssue]:
-    """ORD-004 only (Final Plan §C/§H): current status is DRAFT; at least one OrderLine;
-    fulfillment_date present. Pure — no DB access, no re-validation of any reference's
-    active-state at all, so a carried-forward archived reference can never cause a false
-    rejection here (ADR-108). Never mutates anything, never checks anything beyond ORD-004
-    — Phase 6 does not persist CONFIRMED under any circumstance; this function only reports
-    whether the *structural* prerequisites are met."""
+    """Status-independent structural prerequisites ANY confirmed operational state must
+    retain (Final Plan §C/§H, generalized by the Phase 7 Final Lifecycle Invariant
+    Correction Plan, Finding A): at least one OrderLine; fulfillment_date present. Pure
+    — no DB access, no re-validation of any reference's active-state at all, so a
+    carried-forward archived reference can never cause a false rejection here (ADR-108).
+    Never mutates anything. Shared by both `check_structural_confirmation_readiness`
+    (the Draft->Confirmed transition, ORD-004) and `update_confirmed_order`'s own
+    candidate-state guard (a CONFIRMED Order's proposed edit payload) — the SAME
+    structural rule applies to both, only the status precondition differs."""
     issues: list[ConfirmationIssue] = []
-    if status != "DRAFT":
-        issues.append(
-            ConfirmationIssue(
-                severity="ERROR",
-                code="ORDER_STATUS_NOT_DRAFT",
-                message="Only a Draft order can be confirmed.",
-                field="status",
-            )
-        )
     if line_count < 1:
         issues.append(
             ConfirmationIssue(
@@ -314,4 +308,30 @@ def check_structural_confirmation_readiness(
                 field="fulfillment_date",
             )
         )
+    return issues
+
+
+def check_structural_confirmation_readiness(
+    *, status: str, line_count: int, fulfillment_date_present: bool
+) -> list[ConfirmationIssue]:
+    """ORD-004 only (Final Plan §C/§H): current status is DRAFT, plus every candidate
+    structural prerequisite `check_candidate_structural_readiness` already checks. Never
+    checks anything beyond ORD-004 — Phase 6 does not persist CONFIRMED under any
+    circumstance; this function only reports whether the *structural* prerequisites are
+    met."""
+    issues: list[ConfirmationIssue] = []
+    if status != "DRAFT":
+        issues.append(
+            ConfirmationIssue(
+                severity="ERROR",
+                code="ORDER_STATUS_NOT_DRAFT",
+                message="Only a Draft order can be confirmed.",
+                field="status",
+            )
+        )
+    issues.extend(
+        check_candidate_structural_readiness(
+            line_count=line_count, fulfillment_date_present=fulfillment_date_present
+        )
+    )
     return issues
