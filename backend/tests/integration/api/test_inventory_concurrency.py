@@ -1,8 +1,21 @@
 """Inventory concurrency/race tests (Phase 5 Plan §G; approved decision 4's required
 race coverage): the Initial-Balance/first-Restock creation races for both Ingredient and
-Purchased Product Inventory, proving the shared-ancestor row lock (ADR-106) correctly
-serializes every combination rather than relying on the database's own `UNIQUE`
-constraint as the primary mechanism.
+Purchased Product Inventory.
+
+The two resources are serialized differently (ADR-110), and the tests below assert exactly
+what each mechanism guarantees:
+
+* Ingredient Initial Balance vs. Ingredient Initial Balance — the Ingredient row is locked
+  (`SELECT ... FOR UPDATE`) only for the Initial-Balance call, so two concurrent Initial
+  Balances serialize on that row lock.
+* Ingredient Initial Balance vs. Ingredient Restock — an *asymmetric* race: Restock takes no
+  lock, so this is a row-lock plus optimistic-version (`version_id_col`) race in which
+  either operation may legitimately commit first. The invariant is not "who wins" but that
+  exactly one mutation commits, the loser gets `409 STALE_VERSION`, and no update or history
+  row is lost or duplicated.
+* Purchased Product Inventory — no inventory row (hence no inventory version) exists before
+  the first Initial Balance/Restock, so creation serializes on the shared parent-Product
+  lock (ADR-106/113) rather than on any inventory-row version.
 """
 
 from __future__ import annotations
@@ -10,7 +23,10 @@ from __future__ import annotations
 import threading
 from decimal import Decimal
 
+import pytest
+
 from app.core.api_errors import ApiError
+from app.db.enums import InventoryTransactionType
 from app.db.models.business import Business
 from app.db.models.ingredient import Ingredient, InventoryTransaction
 from app.db.models.purchased_inventory import (
@@ -165,85 +181,206 @@ def test_two_concurrent_ingredient_initial_balances_exactly_one_wins(
 
 # --- Ingredient: Initial Balance racing a concurrent Restock -----------------------------
 
+# Request values shared by the race and the deterministic tests below, chosen so the two
+# possible winners leave unmistakably different state:
+#   Initial Balance (100 g @ 2): quantity 100, WAC 2, latest-purchase NULL, replacement NULL.
+#   Restock (1 g @ 9) on a fresh, never-stocked Ingredient: quantity 1, WAC 9 (a non-positive
+#   prior balance does not participate in the blend, ADR-111), latest-purchase 9,
+#   replacement NULL.
 
-def test_ingredient_initial_balance_racing_a_concurrent_restock_never_loses_an_update(
-    real_session_factory,
-):
-    """Restock never locks — this proves the interleaving is still safe purely from
-    combining the Initial-Balance lock with `version_id_col`: Restock either reads the
-    ingredient before Initial Balance commits (and later fails at `commit_or_raise_stale`
-    once its blocked `UPDATE` finally runs against a since-bumped version) or reads it
-    after (and fails synchronously at `check_version`) — every interleaving ends the same
-    way: Initial Balance always succeeds, Restock always receives `409 STALE_VERSION`,
-    and the final state is exactly Initial Balance's own values, never a lost update."""
+
+def _read_ingredient_state(real_session_factory, ingredient_id):
+    verify_db = real_session_factory()
+    try:
+        ingredient = verify_db.get(Ingredient, ingredient_id)
+        transactions = (
+            verify_db.query(InventoryTransaction)
+            .filter(InventoryTransaction.ingredient_id == ingredient_id)
+            .all()
+        )
+        return ingredient, transactions
+    finally:
+        verify_db.close()
+
+
+def _assert_initial_balance_state(ingredient, transactions):
+    """Initial Balance sets exactly physical quantity and WAC (ADR-110): it never sets
+    Latest Purchase Cost and never creates a Replacement Cost override."""
+    assert ingredient.physical_quantity == Decimal("100")
+    assert ingredient.weighted_average_unit_cost == Decimal("2")
+    assert ingredient.latest_purchase_unit_cost is None
+    assert ingredient.replacement_unit_cost is None
+    assert ingredient.version == 2
+    assert len(transactions) == 1, "exactly one history row may exist"
+    (txn,) = transactions
+    assert txn.transaction_type == InventoryTransactionType.INITIAL_BALANCE
+    assert txn.quantity_change == Decimal("100")
+    assert txn.unit_cost == Decimal("2")
+    assert txn.total_cost == Decimal("200")
+
+
+def _assert_restock_state(ingredient, transactions):
+    """A Restock sets quantity, WAC, and Latest Purchase Cost, and never touches the
+    Replacement Cost override (approval decision 5)."""
+    assert ingredient.physical_quantity == Decimal("1")
+    assert ingredient.weighted_average_unit_cost == Decimal("9")
+    assert ingredient.latest_purchase_unit_cost == Decimal("9")
+    assert ingredient.replacement_unit_cost is None
+    assert ingredient.version == 2
+    assert len(transactions) == 1, "exactly one history row may exist"
+    (txn,) = transactions
+    assert txn.transaction_type == InventoryTransactionType.RESTOCK
+    assert txn.quantity_change == Decimal("1")
+    assert txn.unit_cost == Decimal("9")
+    assert txn.total_cost == Decimal("9")
+
+
+def _new_unstocked_ingredient(real_session_factory):
     setup_db = real_session_factory()
     try:
         business = make_business_graph(setup_db)
         ingredient = make_ingredient(setup_db, business)
         setup_db.commit()
-        business_id, ingredient_id = business.id, ingredient.id
+        return business.id, ingredient.id
     finally:
         setup_db.close()
 
+
+def _initial_balance_call(real_session_factory, business_id, ingredient_id):
+    db = real_session_factory()
+    try:
+        business_row = db.get(Business, business_id)
+        payload = IngredientInitialBalanceRequest(
+            version=1, quantity="100", unit="g", unit_cost="2"
+        )
+        ingredient_inventory_service.create_initial_balance(
+            db, business_row, ingredient_id, payload
+        )
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _restock_call(real_session_factory, business_id, ingredient_id):
+    db = real_session_factory()
+    try:
+        business_row = db.get(Business, business_id)
+        payload = IngredientRestockRequest(version=1, quantity="1", unit="g", unit_cost="9")
+        ingredient_inventory_service.restock_ingredient(db, business_row, ingredient_id, payload)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def test_ingredient_initial_balance_racing_a_concurrent_restock_never_loses_an_update(
+    real_session_factory,
+):
+    """Initial Balance (which locks the Ingredient row) racing Restock (which takes no
+    lock) is an *asymmetric* race: the outcome combines the row lock with the optimistic
+    `version_id_col` check, and EITHER operation may legitimately commit first depending
+    on scheduling. This test deliberately does not assume a winner (a CI run saw Restock
+    win; a local run typically sees Initial Balance win; both are correct).
+
+    Whichever commits first bumps `version` 1 -> 2 atomically with its own history row, so
+    the other operation, which submitted `version=1`, can only end in `409 STALE_VERSION`
+    (synchronously at `check_version` if it reads after the commit, or at
+    `commit_or_raise_stale` if its `UPDATE` raced the winner). The invariant verified is:
+    both threads terminate; exactly one operation succeeds and exactly one gets a
+    structured `STALE_VERSION` `ApiError` (no raw exception escapes); exactly one history
+    row exists; the final state is precisely the winner's own values at `version == 2`;
+    nothing from the loser survives."""
+    business_id, ingredient_id = _new_unstocked_ingredient(real_session_factory)
+
     start_barrier = threading.Barrier(2)
-    results: list[tuple[str, object]] = []
+    results: list[tuple[str, str, object]] = []  # (operation, outcome, error-or-None)
 
-    def _initial_balance():
-        db = real_session_factory()
-        start_barrier.wait(timeout=5)
+    def _run(operation, call):
         try:
-            business_row = db.get(Business, business_id)
-            payload = IngredientInitialBalanceRequest(
-                version=1, quantity="100", unit="g", unit_cost="2"
-            )
-            ingredient_inventory_service.create_initial_balance(
-                db, business_row, ingredient_id, payload
-            )
-            results.append(("initial_balance_ok", None))
+            start_barrier.wait(timeout=5)
+            call(real_session_factory, business_id, ingredient_id)
+            results.append((operation, "ok", None))
         except ApiError as exc:
-            db.rollback()
-            results.append(("initial_balance_error", exc))
-        finally:
-            db.close()
-
-    def _restock():
-        db = real_session_factory()
-        start_barrier.wait(timeout=5)
-        try:
-            business_row = db.get(Business, business_id)
-            payload = IngredientRestockRequest(version=1, quantity="1", unit="g", unit_cost="9")
-            ingredient_inventory_service.restock_ingredient(
-                db, business_row, ingredient_id, payload
-            )
-            results.append(("restock_ok", None))
-        except ApiError as exc:
-            db.rollback()
-            results.append(("restock_error", exc))
-        finally:
-            db.close()
+            results.append((operation, "api_error", exc))
+        except Exception as exc:  # noqa: BLE001 - recorded so the assertions below fail loudly
+            results.append((operation, "raw_exception", exc))
 
     try:
-        threads = [threading.Thread(target=_initial_balance), threading.Thread(target=_restock)]
+        threads = [
+            threading.Thread(target=_run, args=("initial_balance", _initial_balance_call)),
+            threading.Thread(target=_run, args=("restock", _restock_call)),
+        ]
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=10)
+            t.join(timeout=15)
 
-        kinds = {kind for kind, _ in results}
-        assert "initial_balance_ok" in kinds, results
-        assert "restock_error" in kinds, results
-        restock_error = next(r for k, r in results if k == "restock_error")
-        assert restock_error.code == "STALE_VERSION"
+        assert not any(t.is_alive() for t in threads), "a thread never terminated"
+        assert len(results) == 2, results
+        raw = [r for r in results if r[1] == "raw_exception"]
+        assert not raw, f"a raw (non-ApiError) exception escaped: {raw}"
 
-        verify_db = real_session_factory()
-        try:
-            final_ingredient = verify_db.get(Ingredient, ingredient_id)
-            # Initial Balance's own values — the Restock never got applied.
-            assert final_ingredient.physical_quantity == 100
-            assert final_ingredient.weighted_average_unit_cost == 2
-            assert final_ingredient.version == 2
-        finally:
-            verify_db.close()
+        winners = [r for r in results if r[1] == "ok"]
+        losers = [r for r in results if r[1] == "api_error"]
+        assert len(winners) == 1, results
+        assert len(losers) == 1, results
+        winner_operation = winners[0][0]
+        loser_operation, _, loser_error = losers[0]
+        assert loser_operation != winner_operation
+        assert isinstance(loser_error, ApiError)
+        assert loser_error.status_code == 409
+        assert loser_error.code == "STALE_VERSION", loser_error.code
+
+        ingredient, transactions = _read_ingredient_state(real_session_factory, ingredient_id)
+        if winner_operation == "initial_balance":
+            _assert_initial_balance_state(ingredient, transactions)  # Restock left no trace
+        else:
+            assert winner_operation == "restock", winner_operation
+            _assert_restock_state(ingredient, transactions)  # Initial Balance left no trace
+    finally:
+        _cleanup(real_session_factory, business_id=business_id)
+
+
+def test_restock_committing_first_rejects_a_stale_initial_balance_without_overwriting_it(
+    real_session_factory,
+):
+    """Deterministic complement to the race test above for the branch a scheduler may or
+    may not produce: Restock commits first, so a later Initial Balance that still carries
+    the pre-Restock `version=1` is rejected with `STALE_VERSION` and leaves the Restock's
+    state and history row exactly intact."""
+    business_id, ingredient_id = _new_unstocked_ingredient(real_session_factory)
+    try:
+        _restock_call(real_session_factory, business_id, ingredient_id)
+        with pytest.raises(ApiError) as exc_info:
+            _initial_balance_call(real_session_factory, business_id, ingredient_id)
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == "STALE_VERSION"
+
+        ingredient, transactions = _read_ingredient_state(real_session_factory, ingredient_id)
+        _assert_restock_state(ingredient, transactions)
+    finally:
+        _cleanup(real_session_factory, business_id=business_id)
+
+
+def test_initial_balance_committing_first_rejects_a_stale_restock_without_applying_it(
+    real_session_factory,
+):
+    """Deterministic complement for the opposite branch: Initial Balance commits first, so
+    a later Restock still carrying `version=1` is rejected with `STALE_VERSION` and no
+    Restock mutation or history row survives."""
+    business_id, ingredient_id = _new_unstocked_ingredient(real_session_factory)
+    try:
+        _initial_balance_call(real_session_factory, business_id, ingredient_id)
+        with pytest.raises(ApiError) as exc_info:
+            _restock_call(real_session_factory, business_id, ingredient_id)
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == "STALE_VERSION"
+
+        ingredient, transactions = _read_ingredient_state(real_session_factory, ingredient_id)
+        _assert_initial_balance_state(ingredient, transactions)
     finally:
         _cleanup(real_session_factory, business_id=business_id)
 
