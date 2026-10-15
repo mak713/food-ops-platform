@@ -10,22 +10,32 @@ Lock §A).
 
 from __future__ import annotations
 
+import hashlib
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
+from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.api_errors import ApiError
-from app.core.tenant import check_version, commit_or_raise_stale, lock_recipe_for_product
-from app.db.enums import OrderLineType, OrderStatus, ProductType
+from app.core.tenant import (
+    NotFoundError,
+    check_version,
+    commit_or_raise_stale,
+    lock_recipe_for_product,
+)
+from app.db.enums import CostType, OrderLineType, OrderStatus, ProductType
 from app.db.models.business import Business
+from app.db.models.cost import OrderCostAllocation
 from app.db.models.order import Order, OrderStatusHistory
-from app.db.models.product import Product
+from app.db.models.product import Product, SellingOption
+from app.db.models.production import ProductionRunOrderAllocation
 from app.db.models.purchased_inventory import PurchasedProductInventory
 from app.db.models.surplus import SurplusInventory
 from app.domain import order_pricing
-from app.services import ingredient_service, order_service
+from app.services import ingredient_service, order_service, readiness_service
 from app.services.operational_recalculation_service import (
     IngredientShortageResult,
     RecalcResult,
@@ -35,6 +45,78 @@ from app.services.operational_recalculation_service import (
     revisions_participating_in_closure,
     validate_fulfillment_local_time,
 )
+
+_MAX_DISCOVERY_RETRIES = 3
+"""Matches the identical bounded-retry constant already used by
+`production_run_service.py`/`surplus_service.py`/`purchased_inventory_service.py`
+for the same discover-lock-verify-retry protocol, reused here (Independent
+Implementation Review Remediation Plan v1.1 §1/v1.2)."""
+
+
+class _CandidateOrderSetGrew(Exception):
+    """Internal-only retry signal — mirrors the identical exception already defined
+    in `production_run_service.py`/`surplus_service.py`; a distinct instance per
+    module by established convention (never a shared cross-module exception type)."""
+
+
+def _discover_full_order_set(
+    db: Session, business: Business, order_id: uuid.UUID, product_ids: Iterable[uuid.UUID]
+) -> set[uuid.UUID]:
+    """Non-locking discovery of every Order this recalculation could need to lock —
+    the directly-addressed Order (`order_id`, included unconditionally, even while
+    still `DRAFT` and therefore invisible to `discover_candidate_order_ids`' own
+    CONFIRMED/READY filter) union every other CONFIRMED/READY Order referencing any
+    of `product_ids` (Remediation Plan v1.2 §1 — every Order lock, including the
+    directly-addressed one, is acquired in exactly one globally-sorted phase; never
+    lock the directly-addressed Order separately/first)."""
+    ids = {order_id}
+    for product_id in product_ids:
+        ids |= set(readiness_service.discover_candidate_order_ids(db, business, product_id))
+    return ids
+
+
+def _lock_orders_sorted(
+    db: Session, business: Business, order_ids: set[uuid.UUID]
+) -> dict[uuid.UUID, Order]:
+    return {
+        o.id: o
+        for o in db.scalars(
+            select(Order)
+            .where(Order.id.in_(order_ids), Order.business_id == business.id)
+            .order_by(Order.id)
+            .with_for_update()
+        )
+    }
+
+
+def _preflight_resolve_payload_product_ids(
+    db: Session, business: Business, payload
+) -> set[uuid.UUID]:
+    """Non-locking, best-effort resolution of a proposed edit payload's Product
+    references — discovery-only (Remediation Plan v1.2 §1, correcting v1.1 §2's
+    `update_confirmed_order` product-universe gap: a Product a line is being
+    CHANGED TO, or a brand-new Product-backed line, must be discovered against too,
+    not only the currently-persisted Products). A garbage/foreign-tenant/nonexistent
+    `selling_option_id` here simply fails to contribute a product id — harmless,
+    since the authoritative resolution/validation remains
+    `order_service._prepare_order_edit`, unchanged, run later under lock."""
+    product_ids: set[uuid.UUID] = set()
+    selling_option_ids: set[uuid.UUID] = set()
+    for line in payload.lines:
+        if line.product_id is not None:
+            product_ids.add(line.product_id)
+        elif line.selling_option_id is not None:
+            selling_option_ids.add(line.selling_option_id)
+    if selling_option_ids:
+        product_ids |= set(
+            db.scalars(
+                select(SellingOption.product_id).where(
+                    SellingOption.id.in_(selling_option_ids),
+                    SellingOption.business_id == business.id,
+                )
+            )
+        )
+    return product_ids
 
 
 def get_order_production_locked_line_ids(
@@ -328,12 +410,71 @@ def confirm_order(
     acknowledged_warning_fingerprints: set[str],
     business_today,
 ) -> tuple[Order, list[RecalcResult]]:
-    """Confirm (Plan v2 §6/§11, Final Architecture Lock §A): lock -> validate ->
-    lock operational graph -> mutate status/history + `touch_order` -> flush (not
-    commit) -> recalculate -> warning review -> commit once, or roll back the
-    entire attempt (leaving the Order `DRAFT`, zero operational rows) if warnings
-    are unacknowledged or recalculation fails."""
-    order = order_service.get_order_for_business_locked(db, order_id, business)
+    """Confirm (Plan v2 §6/§11, Final Architecture Lock §A, corrected by Independent
+    Implementation Review Remediation Plan v1.1/v1.2 §1/§2): bounded-retry wrapper
+    around `_confirm_order_attempt` — a full non-locking-preflight-through-commit
+    cycle re-run from scratch whenever the candidate cross-Order set is found to
+    have grown after Product is locked, exactly matching
+    `production_run_service.finish_production`'s/`surplus_service`'s identical
+    shape."""
+    for _attempt in range(_MAX_DISCOVERY_RETRIES):
+        try:
+            return _confirm_order_attempt(
+                db,
+                business,
+                order_id,
+                expected_version=expected_version,
+                acknowledged_warning_fingerprints=acknowledged_warning_fingerprints,
+                business_today=business_today,
+            )
+        except _CandidateOrderSetGrew:
+            db.rollback()
+            continue
+    raise ApiError(
+        409,
+        "ORDER_LOCK_DISCOVERY_CONTENTION",
+        "Too many concurrent changes affecting this order's demand; please retry.",
+    )
+
+
+def _confirm_order_attempt(
+    db: Session,
+    business: Business,
+    order_id: uuid.UUID,
+    *,
+    expected_version: int,
+    acknowledged_warning_fingerprints: set[str],
+    business_today,
+) -> tuple[Order, list[RecalcResult]]:
+    """Lock -> validate -> lock operational graph -> mutate status/history +
+    `touch_order` -> flush (not commit) -> recalculate -> warning review -> promote
+    self + reevaluate every other candidate Order's readiness -> commit once, or
+    roll back the entire attempt (leaving the Order `DRAFT`, zero operational rows)
+    if warnings are unacknowledged, the candidate set grew, or recalculation fails.
+
+    Locking (Remediation Plan v1.2 §1 — corrected from the self-first sequencing a
+    naive reading of v1.1 might suggest): a non-locking preflight read of this
+    Order's *currently persisted* lines seeds discovery of every OTHER
+    CONFIRMED/READY Order that could be affected by this Product's recalculation;
+    the directly-addressed Order id is unioned in explicitly (it's still `DRAFT` at
+    discovery time, so `discover_candidate_order_ids`' own CONFIRMED/READY filter
+    would otherwise miss it); the *entire* resulting set — self included — is then
+    acquired in exactly one sorted `SELECT ... FOR UPDATE` phase, never a
+    lock-self-then-lock-others sequence (which is not globally deadlock-safe: two
+    transactions each confirming/editing/canceling a different Order that both
+    reference the same Product could lock their own "self" first and then
+    reciprocally wait on each other's self)."""
+    preflight = order_service.get_order_for_business(db, order_id, business)
+    preflight_products = {
+        line.product_id for line in preflight.lines if line.product_id is not None
+    }
+    candidate_ids = _discover_full_order_set(db, business, order_id, preflight_products)
+    locked_orders = _lock_orders_sorted(db, business, candidate_ids)
+    order = locked_orders.get(order_id)
+    if order is None:
+        raise NotFoundError()
+
+    results: list[RecalcResult] = []
     try:
         check_version(order, expected_version, resource="order")
         if order.status is not OrderStatus.DRAFT:
@@ -357,6 +498,15 @@ def confirm_order(
         validate_fulfillment_local_time(business, order.fulfillment_date, order.fulfillment_time)
 
         products = _acquire_operational_lock_graph(db, business, order)
+
+        # Re-verify the candidate set under Product serialization (Remediation Plan
+        # v1.2 §1 step 8) — if a new Order confirmed/edited for one of these
+        # Products between the non-locking discovery above and this Product lock,
+        # the locked set is incomplete; abandon this attempt entirely (never
+        # escalate a partial lock) and let the outer wrapper retry from scratch.
+        s1 = _discover_full_order_set(db, business, order_id, {p.id for p in products})
+        if not s1.issubset(locked_orders.keys()):
+            raise _CandidateOrderSetGrew()
 
         order.status = OrderStatus.CONFIRMED
         order.confirmed_at = datetime.now(UTC)
@@ -393,6 +543,17 @@ def confirm_order(
                     combined_ingredient_shortages=combined_ingredient_shortages,
                 ),
             )
+
+        # Cross-Order readiness (Independent Implementation Review Remediation Plan
+        # v1/v1.1 §1/§2, Finding 2/3): this Order may itself now be fully satisfied
+        # (e.g. by existing Surplus/Purchased stock) and every OTHER locked
+        # candidate Order's satisfaction may have changed too, since this
+        # confirmation's recalculation can compete for the same Product's Surplus/
+        # Purchased capacity another Order relied on.
+        readiness_service.evaluate_and_apply_readiness(db, business, order)
+        for other_id, other_order in locked_orders.items():
+            if other_id != order.id:
+                readiness_service.evaluate_and_apply_readiness(db, business, other_order)
     except ApiError:
         db.rollback()
         raise
@@ -411,26 +572,77 @@ def update_confirmed_order(
     acknowledged_warning_fingerprints: set[str],
     business_today,
 ) -> tuple[Order, list[RecalcResult]]:
+    """Bounded-retry wrapper around `_update_confirmed_order_attempt` — see
+    `confirm_order`'s identical wrapper for the shared rationale (Independent
+    Implementation Review Remediation Plan v1.1/v1.2 §1)."""
+    for _attempt in range(_MAX_DISCOVERY_RETRIES):
+        try:
+            return _update_confirmed_order_attempt(
+                db,
+                business,
+                order_id,
+                payload,
+                expected_version=expected_version,
+                acknowledged_warning_fingerprints=acknowledged_warning_fingerprints,
+                business_today=business_today,
+            )
+        except _CandidateOrderSetGrew:
+            db.rollback()
+            continue
+    raise ApiError(
+        409,
+        "ORDER_LOCK_DISCOVERY_CONTENTION",
+        "Too many concurrent changes affecting this order's demand; please retry.",
+    )
+
+
+def _update_confirmed_order_attempt(
+    db: Session,
+    business: Business,
+    order_id: uuid.UUID,
+    payload,
+    *,
+    expected_version: int,
+    acknowledged_warning_fingerprints: set[str],
+    business_today,
+) -> tuple[Order, list[RecalcResult]]:
     """Confirmed-Order editing (Phase 7 Implementation Remediation Plan, Finding 1,
     completed by the Phase 7 Final Remediation Correction Plan, Finding 1; Plan v2
-    §6/§11; Final Architecture Lock §A/§B/§C/§F): lock/version -> reject an edit that
-    would alter protected operational demand (per-line, §C) -> Phase A
-    (`order_service._prepare_order_edit`) validates/locks Customer + the operational
-    Product superset (newly-referenced ids UNION every Product this edit might
-    recalculate) + Selling Options in ONE pass, with NO Order/OrderLine mutation yet
-    -> Recipe/Ingredient/Surplus locks for every affected Product -> Phase B
+    §6/§11; Final Architecture Lock §A/§B/§C/§F; corrected by Independent
+    Implementation Review Remediation Plan v1.1/v1.2 §1/§2): non-locking preflight
+    (this Order's currently-persisted Products UNION a best-effort resolution of the
+    proposed payload's Products/Selling-Options — Remediation Plan v1.2 §1's
+    correction: the old set alone misses a line being moved TO a new Product) ->
+    discover every other candidate Order -> lock the ENTIRE Order set (self
+    included) in one sorted phase -> revalidate self under lock -> reject an edit
+    that would alter protected operational demand (per-line, §C) -> Phase A
+    (`order_service._prepare_order_edit`) validates/locks Customer + the REAL,
+    authoritative operational Product superset + Selling Options in ONE pass, with
+    NO Order/OrderLine mutation yet -> Recipe/Ingredient/Surplus locks for every
+    affected Product -> re-verify the candidate Order set under Product
+    serialization, retry the whole attempt if grown -> Phase B
     (`order_service._apply_order_edit_body`) applies the complete proposed
     Order/OrderLine state (never a partial patch) using Phase A's already-locked
     references -> `touch_order()` -> flush (not commit) -> recalculate every affected
     Product's closure, only when the edit is demand-affecting (Plan v2 §11 table —
-    price/notes/customer-financial-only edits never recalculate) -> fresh warning
-    review using the same fingerprint-acknowledgement protocol confirmation itself
-    uses (§F) -> commit once, or roll back the ENTIRE edit if recalculation or
-    warning review fails. Splitting validate/lock from reconcile/mutate makes the
-    "every operational lock before any write" invariant hold by construction, rather
-    than depending on the session's `autoflush=False` setting to merely happen to
-    prevent an early write."""
-    order = order_service.get_order_for_business_locked(db, order_id, business)
+    price/notes/customer-financial-only edits never recalculate, never lock/discover
+    beyond the Order-set phase) -> fresh warning review using the same fingerprint-
+    acknowledgement protocol confirmation itself uses (§F) -> promote/demote self and
+    every other locked Order's readiness -> commit once, or roll back the ENTIRE edit
+    if recalculation, warning review, or candidate-set verification fails."""
+    preflight = order_service.get_order_for_business(db, order_id, business)
+    preflight_old_product_ids = {
+        line.product_id for line in preflight.lines if line.product_id is not None
+    }
+    preflight_new_product_ids = _preflight_resolve_payload_product_ids(db, business, payload)
+    candidate_ids = _discover_full_order_set(
+        db, business, order_id, preflight_old_product_ids | preflight_new_product_ids
+    )
+    locked_orders = _lock_orders_sorted(db, business, candidate_ids)
+    order = locked_orders.get(order_id)
+    if order is None:
+        raise NotFoundError()
+
     results: list[RecalcResult] = []
     try:
         check_version(order, expected_version, resource="order")
@@ -484,7 +696,10 @@ def update_confirmed_order(
         )
         # Amendment §6's composed ordering: the operational Product superset is only
         # relevant (and only locked) when the edit actually needs recalculation —
-        # a price/notes-only edit locks no more than Phase 6 already would.
+        # a price/notes-only edit locks no more than Phase 6 already would. This is
+        # the REAL, authoritative superset (computed from the now-locked Order and
+        # the payload together) — the preflight union above was only ever a
+        # discovery-time approximation used to decide who to lock.
         additional_product_ids = (
             (old_product_ids | new_product_ids) if demand_affecting else (frozenset())
         )
@@ -515,6 +730,16 @@ def update_confirmed_order(
             ]
             _acquire_recipe_and_ingredient_locks(db, business, affected_products)
             _acquire_surplus_and_purchased_locks(db, business, affected_products)
+
+            # Re-verify the candidate set under Product serialization (Remediation
+            # Plan v1.2 §1 step 8), now using the REAL affected-Product set rather
+            # than the preflight approximation — if it grew (a new Order confirmed
+            # against one of these Products, or the payload's real resolution
+            # touches a Product the preflight missed), abandon this attempt entirely
+            # and let the outer wrapper retry from a clean, fully-unlocked state.
+            s1 = _discover_full_order_set(db, business, order_id, {p.id for p in affected_products})
+            if not s1.issubset(locked_orders.keys()):
+                raise _CandidateOrderSetGrew()
 
         order_service._apply_order_edit_body(
             db,
@@ -553,12 +778,101 @@ def update_confirmed_order(
                         combined_ingredient_shortages=combined_ingredient_shortages,
                     ),
                 )
+
+            # Cross-Order readiness (Independent Implementation Review Remediation
+            # Plan v1/v1.1 §1/§2, Finding 2/3) — only meaningful when recalculation
+            # actually ran; a non-demand-affecting edit changes nothing any Order's
+            # satisfaction could depend on.
+            readiness_service.evaluate_and_apply_readiness(db, business, order)
+            for other_id, other_order in locked_orders.items():
+                if other_id != order.id:
+                    readiness_service.evaluate_and_apply_readiness(db, business, other_order)
     except ApiError:
         db.rollback()
         raise
 
     commit_or_raise_stale(db, resource="order")
     return order, results
+
+
+def _order_completed_production_allocation_totals(
+    db: Session, business: Business, order: Order
+) -> tuple[Decimal, Decimal]:
+    """Sum of completed `ProductionRunOrderAllocation` quantity and `PRODUCTION`-type
+    historical cost already attributed to this Order's lines — the exact figures the
+    post-production cancellation warning fingerprint depends on."""
+    line_ids = [line.id for line in order.lines]
+    if not line_ids:
+        return Decimal(0), Decimal(0)
+    total_quantity = db.scalar(
+        select(func.coalesce(func.sum(ProductionRunOrderAllocation.quantity), 0)).where(
+            ProductionRunOrderAllocation.order_line_id.in_(line_ids),
+            ProductionRunOrderAllocation.business_id == business.id,
+        )
+    )
+    total_cost = db.scalar(
+        select(func.coalesce(func.sum(OrderCostAllocation.amount), 0)).where(
+            OrderCostAllocation.order_id == order.id,
+            OrderCostAllocation.cost_type == CostType.PRODUCTION,
+            OrderCostAllocation.business_id == business.id,
+        )
+    )
+    return total_quantity, total_cost
+
+
+def _cancellation_after_production_fingerprint(
+    order: Order, *, total_quantity: Decimal, total_cost: Decimal
+) -> str:
+    """Deterministic content-hash over exactly the authoritative, freshly-recomputed
+    consequence state (Phase 8 Final Architecture Lock Addendum §A, reusing the
+    RUN-004/ADR-128 fingerprint pattern) — never a client-supplied value, always
+    recomputed fresh under the Order lock on every attempt."""
+    payload = f"{order.id}:{total_quantity}:{total_cost}"
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _reject_if_cancellation_after_production_unacknowledged(
+    db: Session, business: Business, order: Order, *, acknowledged_warning_fingerprint: str | None
+) -> None:
+    """The two-tier Cancel rule for CONFIRMED/READY (Phase 8 Final Architecture Lock
+    Addendum §A): an `IN_PRODUCTION`-covered line still hard-blocks Cancel entirely
+    (`_reject_if_production_locked`, called separately, unchanged). A line covered
+    only by COMPLETED, historical production (no active run remains) does not block
+    Cancel — it requires explicit warning acknowledgment first, mirroring RUN-004's
+    fingerprint protocol exactly."""
+    total_quantity, total_cost = _order_completed_production_allocation_totals(db, business, order)
+    if total_quantity <= 0:
+        return
+
+    fingerprint = _cancellation_after_production_fingerprint(
+        order, total_quantity=total_quantity, total_cost=total_cost
+    )
+    if acknowledged_warning_fingerprint == fingerprint:
+        return
+
+    raise ApiError(
+        409,
+        "CANCELLATION_AFTER_PRODUCTION_REQUIRES_ACKNOWLEDGMENT",
+        "This order has completed production history. Review and acknowledge before canceling.",
+        issues=[
+            {
+                "severity": "WARNING",
+                "code": "CANCELLATION_AFTER_PRODUCTION",
+                "message": (
+                    f"{total_quantity} units already produced for this order "
+                    f"(historical cost {total_cost}) will remain a permanent, immutable "
+                    "record. Ingredients already consumed will not be restored."
+                ),
+                "field": None,
+                "resource": "order",
+                "details": {
+                    "produced_quantity": str(total_quantity),
+                    "historical_cost": str(total_cost),
+                    "fingerprint": fingerprint,
+                },
+            }
+        ],
+    )
 
 
 def cancel_confirmed_order(
@@ -568,26 +882,100 @@ def cancel_confirmed_order(
     *,
     expected_version: int,
     business_today,
+    acknowledged_warning_fingerprint: str | None = None,
 ) -> tuple[Order, list[RecalcResult]]:
-    """Cancel (Plan v2 §11, corrected by Final Architecture Lock §A/§C): blocked
-    entirely while any of this Order's demand is production-locked."""
-    order = order_service.get_order_for_business_locked(db, order_id, business)
+    """Bounded-retry wrapper around `_cancel_confirmed_order_attempt` — see
+    `confirm_order`'s identical wrapper for the shared rationale (Independent
+    Implementation Review Remediation Plan v1.1/v1.2 §1)."""
+    for _attempt in range(_MAX_DISCOVERY_RETRIES):
+        try:
+            return _cancel_confirmed_order_attempt(
+                db,
+                business,
+                order_id,
+                expected_version=expected_version,
+                business_today=business_today,
+                acknowledged_warning_fingerprint=acknowledged_warning_fingerprint,
+            )
+        except _CandidateOrderSetGrew:
+            db.rollback()
+            continue
+    raise ApiError(
+        409,
+        "ORDER_LOCK_DISCOVERY_CONTENTION",
+        "Too many concurrent changes affecting this order's demand; please retry.",
+    )
+
+
+def _cancel_confirmed_order_attempt(
+    db: Session,
+    business: Business,
+    order_id: uuid.UUID,
+    *,
+    expected_version: int,
+    business_today,
+    acknowledged_warning_fingerprint: str | None = None,
+) -> tuple[Order, list[RecalcResult]]:
+    """Cancel (Plan v2 §11, corrected by Final Architecture Lock §A/§C, Final
+    Architecture Lock Addendum §A, and Independent Implementation Review Remediation
+    Plan v1.1/v1.2 §1): eligible for `CONFIRMED` and `READY` alike (READY is still
+    pre-Completion). A line still covered by an `IN_PRODUCTION` run hard-blocks
+    Cancel entirely, unchanged. A line covered only by completed, historical
+    production requires explicit warning acknowledgment — Cancel then proceeds
+    without restoring consumed Ingredients, without rewriting any historical
+    `ProductionRun`/`ProductionRunOrderAllocation`/`OrderCostAllocation` row, and
+    without manufacturing a new Surplus lot from the now-unclaimed output.
+
+    **May change another Order's readiness** (Remediation Plan v1/v1.1 §1/§2,
+    Finding 2/3): canceling releases this Order's own Purchased reservation/Surplus
+    allocation claims, which can newly satisfy a sibling Order's previously-unmet
+    demand for the same Product. Locking therefore follows the same single
+    globally-sorted Order-lock phase `confirm_order`/`update_confirmed_order` use —
+    a non-locking preflight discovers every other CONFIRMED/READY Order referencing
+    this Order's currently-persisted Products, the entire set (self included) is
+    locked in one sorted phase, and every other locked Order's readiness is
+    reevaluated after this Order's recalculation-triggered release, all within the
+    same transaction Cancel itself commits."""
+    preflight = order_service.get_order_for_business(db, order_id, business)
+    preflight_products = {
+        line.product_id for line in preflight.lines if line.product_id is not None
+    }
+    candidate_ids = _discover_full_order_set(db, business, order_id, preflight_products)
+    locked_orders = _lock_orders_sorted(db, business, candidate_ids)
+    order = locked_orders.get(order_id)
+    if order is None:
+        raise NotFoundError()
+
+    results: list[RecalcResult] = []
     try:
         check_version(order, expected_version, resource="order")
-        if order.status is not OrderStatus.CONFIRMED:
-            raise ApiError(409, "ORDER_NOT_CONFIRMED", "Only a Confirmed order can be canceled.")
+        if order.status not in (OrderStatus.CONFIRMED, OrderStatus.READY):
+            raise ApiError(
+                409, "ORDER_NOT_CANCELABLE", "Only a Confirmed or Ready order can be canceled."
+            )
 
         _reject_if_production_locked(db, business, order)
+        _reject_if_cancellation_after_production_unacknowledged(
+            db, business, order, acknowledged_warning_fingerprint=acknowledged_warning_fingerprint
+        )
         products = _acquire_operational_lock_graph(db, business, order)
 
+        # Re-verify the candidate set under Product serialization (Remediation Plan
+        # v1.2 §1 step 8) — mirrors `confirm_order`'s identical step.
+        s1 = _discover_full_order_set(db, business, order_id, {p.id for p in products})
+        if not s1.issubset(locked_orders.keys()):
+            raise _CandidateOrderSetGrew()
+
+        from_status = order.status
         order.status = OrderStatus.CANCELED
         order.canceled_at = datetime.now(UTC)
+        order.ready_at = None
         db.add(
             OrderStatusHistory(
                 id=uuid.uuid4(),
                 business_id=business.id,
                 order_id=order.id,
-                from_status=OrderStatus.CONFIRMED,
+                from_status=from_status,
                 to_status=OrderStatus.CANCELED,
                 changed_at=datetime.now(UTC),
             )
@@ -596,10 +984,24 @@ def cancel_confirmed_order(
         db.flush()
 
         # The Order's own status is already CANCELED (flushed) and its lines no
-        # longer count as CONFIRMED demand for `recalculate_product_closure`'s own
-        # query — this recalculation pass naturally rebuilds each affected
-        # Product's closure with this Order's demand absent.
+        # longer count as CONFIRMED/READY demand for `recalculate_product_closure`'s
+        # own query — this recalculation pass naturally rebuilds each affected
+        # Product's closure with this Order's demand absent, which is also what
+        # releases this order's now-stale PurchasedProductReservation/
+        # SurplusAllocation rows (both are rebuildable, since a COMPLETED run's
+        # source requirement is no longer IN_PRODUCTION-protected) — no separate,
+        # explicit release step is needed. Historical ProductionRun/
+        # ProductionRunOrderAllocation/OrderCostAllocation rows are untouched by
+        # this pass entirely (recalculation never reads or writes them).
         results = _recalculate_all(db, business, products, business_today=business_today)
+
+        # Cross-Order readiness (Remediation Plan v1/v1.1 §1/§2, Finding 2/3): this
+        # Order is terminal (CANCELED), so no self-promotion is possible, but every
+        # OTHER locked candidate Order's satisfaction may have changed now that this
+        # Order's claims are released.
+        for other_id, other_order in locked_orders.items():
+            if other_id != order.id:
+                readiness_service.evaluate_and_apply_readiness(db, business, other_order)
     except ApiError:
         db.rollback()
         raise
@@ -776,3 +1178,67 @@ def _warning_issues(
                 }
             )
     return issues
+
+
+def set_custom_item_manual_fulfillment(
+    db: Session,
+    business: Business,
+    order_id: uuid.UUID,
+    order_line_id: uuid.UUID,
+    *,
+    expected_version: int,
+    satisfied: bool,
+) -> Order:
+    """The smallest explicit seller-controlled action for a one-off `CUSTOM_ITEM`
+    line's `manual_fulfillment_satisfied` flag (Independent Implementation Review
+    Remediation Plan v1/v1.2, Finding 4) — `readiness_service` already correctly
+    requires this flag before a Custom Item line counts as satisfied, but no prior
+    application path ever let a seller set it (only direct ORM assignment in
+    tests). Deliberately NOT routed through arbitrary Order editing: a `CUSTOM_ITEM`
+    line never creates Produced/Purchased demand (ORD-009/010,
+    `_line_is_demand_affecting_change`'s own documented rule), so this mutation has
+    no cross-Product, cross-Order, or Recipe/Ingredient/Surplus effect at all —
+    locking self (this Order) is sufficient, no operational lock graph, no
+    discover-lock-verify-retry protocol needed.
+
+    Only `CONFIRMED`/`READY` (both pre-Completion, both where READY evaluation is
+    meaningful) may be mutated; `DRAFT` has no readiness concept yet and
+    `COMPLETED`/`CANCELED` are immutable history. Only a `CUSTOM_ITEM` line with
+    `manual_fulfillment_required` set may be mutated — this flag has no meaning
+    otherwise. Participates in the Order's own optimistic-concurrency version
+    (`touch_order`), and triggers whole-Order readiness evaluation atomically:
+    setting `satisfied=True` may promote CONFIRMED->READY if this was the last
+    unmet line; clearing it on an already-READY Order demotes READY->CONFIRMED,
+    exactly like any other authoritative supply-loss event."""
+    order = order_service.get_order_for_business_locked(db, order_id, business)
+    try:
+        check_version(order, expected_version, resource="order")
+        if order.status not in (OrderStatus.CONFIRMED, OrderStatus.READY):
+            raise ApiError(
+                409,
+                "ORDER_NOT_ELIGIBLE_FOR_MANUAL_FULFILLMENT",
+                "Only a Confirmed or Ready order's line can be marked "
+                "satisfied/unsatisfied this way.",
+            )
+
+        line = next((line for line in order.lines if line.id == order_line_id), None)
+        if line is None:
+            raise NotFoundError()
+        if line.line_type is not OrderLineType.CUSTOM_ITEM or not line.manual_fulfillment_required:
+            raise ApiError(
+                422,
+                "LINE_NOT_MANUAL_FULFILLMENT",
+                "This line is not a Custom Item requiring manual fulfillment.",
+            )
+
+        line.manual_fulfillment_satisfied = satisfied
+        order_service.touch_order(order)
+        db.flush()
+
+        readiness_service.evaluate_and_apply_readiness(db, business, order)
+    except ApiError:
+        db.rollback()
+        raise
+
+    commit_or_raise_stale(db, resource="order")
+    return order

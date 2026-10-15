@@ -4,7 +4,7 @@ Architecture Lock §A/§F)."""
 
 from __future__ import annotations
 
-from datetime import date, time
+from datetime import date, time, timedelta
 from decimal import Decimal
 
 from sqlalchemy import event, select
@@ -32,10 +32,12 @@ from tests.integration.schema.factories import (
     make_production_requirement,
     make_production_requirement_order,
     make_production_run,
+    make_purchased_inventory,
     make_recipe,
     make_recipe_revision,
     make_recipe_revision_ingredient,
     make_selling_option,
+    make_surplus_inventory,
 )
 
 _TODAY = date(2026, 6, 1)
@@ -214,6 +216,169 @@ def test_cancel_releases_reservations(session: Session):
         ).first()
         is None
     )
+
+
+# --- Independent Implementation Review Remediation Plan v1/v1.1 §1/§2, Finding 2/3:
+# cross-Order readiness wired into ordinary confirm/cancel -----------------------
+
+
+def test_confirm_with_existing_surplus_fully_covering_demand_promotes_to_ready(session: Session):
+    """Confirming an Order whose produced demand is already 100% covered by
+    existing Surplus stock must promote it all the way to READY in the SAME
+    transaction — not merely CONFIRMED, requiring some later unrelated event to
+    notice."""
+    business, product, order = _draft_setup(session)
+    make_surplus_inventory(session, business, product, physical_quantity=Decimal("6"))
+    session.commit()
+
+    confirmed, _results = confirm_order(
+        session,
+        business,
+        order.id,
+        expected_version=order.version,
+        acknowledged_warning_fingerprints=set(),
+        business_today=_TODAY,
+    )
+
+    assert confirmed.status == OrderStatus.READY
+    assert confirmed.ready_at is not None
+
+
+def test_confirm_purchased_only_with_sufficient_stock_promotes_to_ready(session: Session):
+    business = make_business_graph(session)
+    product = make_product(session, business, product_type=ProductType.PURCHASED)
+    make_purchased_inventory(session, business, product, physical_quantity=Decimal("10"))
+    order = make_order(session, business, status=OrderStatus.DRAFT)
+    order.fulfillment_date = _TODAY
+    order.fulfillment_time = time(9, 0)
+    make_order_line(
+        session,
+        business,
+        order,
+        line_type=OrderLineType.CUSTOM_QUANTITY,
+        product=product,
+        underlying_quantity=Decimal("3"),
+    )
+    session.flush()
+    session.commit()
+
+    confirmed, _results = confirm_order(
+        session,
+        business,
+        order.id,
+        expected_version=order.version,
+        acknowledged_warning_fingerprints=set(),
+        business_today=_TODAY,
+    )
+
+    assert confirmed.status == OrderStatus.READY
+    assert confirmed.ready_at is not None
+
+
+def test_cancel_releases_supply_promotes_sibling_order_to_ready(session: Session):
+    """Findings 2/3: canceling Order A releases the Surplus it holds, and Order B
+    (already CONFIRMED, shut out of that same Surplus) must be promoted to READY
+    within Cancel's own transaction — the exact "cancellation releases supply"
+    scenario."""
+    business, product, order_a = _draft_setup(session)
+    make_surplus_inventory(session, business, product, physical_quantity=Decimal("6"))
+    session.commit()
+    confirmed_a, _ = confirm_order(
+        session,
+        business,
+        order_a.id,
+        expected_version=order_a.version,
+        acknowledged_warning_fingerprints=set(),
+        business_today=_TODAY,
+    )
+    session.commit()
+    assert confirmed_a.status == OrderStatus.READY
+
+    order_b = make_order(session, business, status=OrderStatus.DRAFT)
+    order_b.fulfillment_date = _TODAY
+    order_b.fulfillment_time = time(9, 0)
+    make_order_line(
+        session,
+        business,
+        order_b,
+        line_type=OrderLineType.CUSTOM_QUANTITY,
+        product=product,
+        underlying_quantity=Decimal("6"),
+    )
+    session.flush()
+    session.commit()
+    confirmed_b, _ = confirm_order(
+        session,
+        business,
+        order_b.id,
+        expected_version=order_b.version,
+        acknowledged_warning_fingerprints=set(),
+        business_today=_TODAY,
+    )
+    session.commit()
+    # Order A already holds the only Surplus lot -- B stays CONFIRMED.
+    assert confirmed_b.status == OrderStatus.CONFIRMED
+
+    order_a_current = session.get(Order, order_a.id)
+    canceled_a, _ = cancel_confirmed_order(
+        session,
+        business,
+        order_a.id,
+        expected_version=order_a_current.version,
+        business_today=_TODAY,
+    )
+    session.commit()
+    assert canceled_a.status == OrderStatus.CANCELED
+
+    session.refresh(order_b)
+    assert order_b.status == OrderStatus.READY
+
+
+def test_confirm_never_deadlocks_confirming_two_orders_for_the_same_product_in_either_order(
+    session: Session,
+):
+    """A regression against the self-first locking bug the v1.1 draft would have
+    had: confirming two Orders for the same Product, one after another in the same
+    session (a stand-in for the deadlock-freedom property the real two-connection
+    concurrency test in `test_phase8_concurrency.py` proves under genuine
+    contention), must succeed cleanly regardless of which Order is confirmed
+    first."""
+    business, product, order_a = _draft_setup(session)
+    order_b = make_order(session, business, status=OrderStatus.DRAFT)
+    order_b.fulfillment_date = _TODAY + timedelta(days=1)
+    order_b.fulfillment_time = time(9, 0)
+    make_order_line(
+        session,
+        business,
+        order_b,
+        line_type=OrderLineType.CUSTOM_QUANTITY,
+        product=product,
+        underlying_quantity=Decimal("6"),
+    )
+    session.flush()
+    session.commit()
+
+    confirmed_a, _ = confirm_order(
+        session,
+        business,
+        order_a.id,
+        expected_version=order_a.version,
+        acknowledged_warning_fingerprints=set(),
+        business_today=_TODAY,
+    )
+    session.commit()
+    confirmed_b, _ = confirm_order(
+        session,
+        business,
+        order_b.id,
+        expected_version=order_b.version,
+        acknowledged_warning_fingerprints=set(),
+        business_today=_TODAY,
+    )
+    session.commit()
+
+    assert confirmed_a.status == OrderStatus.CONFIRMED
+    assert confirmed_b.status == OrderStatus.CONFIRMED
 
 
 # --- Phase 7 Implementation Remediation Plan, Finding 1: `update_confirmed_order` ------

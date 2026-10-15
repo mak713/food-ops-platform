@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.db.enums import (
     CalculationStatus,
+    CostBasisSource,
     MeasurementFamily,
     OrderLineType,
     OrderStatus,
@@ -290,6 +291,8 @@ def make_order_line(
         underlying_quantity=overrides.get("underlying_quantity", 1),
         charged_unit_price_snapshot=overrides.get("charged_unit_price_snapshot", "10.00"),
         line_subtotal=overrides.get("line_subtotal", "10.00"),
+        manual_fulfillment_required=overrides.get("manual_fulfillment_required", False),
+        manual_fulfillment_satisfied=overrides.get("manual_fulfillment_satisfied", False),
     )
     session.add(obj)
     return obj
@@ -428,6 +431,14 @@ def make_production_run(
             "estimated_total_production_cost", Decimal("12.5")
         ),
         started_at=overrides.get("started_at", datetime.now(UTC)),
+        completed_at=overrides.get(
+            "completed_at",
+            datetime.now(UTC) if overrides.get("status") == ProductionRunStatus.COMPLETED else None,
+        ),
+        canceled_at=overrides.get(
+            "canceled_at",
+            datetime.now(UTC) if overrides.get("status") == ProductionRunStatus.CANCELED else None,
+        ),
     )
     session.add(obj)
     return obj
@@ -449,6 +460,8 @@ def make_production_run_ingredient(
         weighted_average_unit_cost_snapshot=overrides.get(
             "weighted_average_unit_cost_snapshot", "0.01"
         ),
+        replacement_unit_cost_snapshot=overrides.get("replacement_unit_cost_snapshot"),
+        cost_basis_source=overrides.get("cost_basis_source", CostBasisSource.WAC),
     )
     session.add(obj)
     return obj
@@ -477,13 +490,27 @@ def make_production_run_order_allocation(
 def make_surplus_inventory(
     session: Session, business: Business, product: Product, **overrides
 ) -> SurplusInventory:
+    source_production_run_id = overrides.get("source_production_run_id")
+    physical_quantity = overrides.get("physical_quantity", 6)
+    unit_cost_basis = overrides.get("unit_cost_basis", "0.50")
+    # ck_surplus_inventory_source_total_cost_basis_provenance_match (Phase 8): a
+    # run-sourced lot always carries its exact origin-cost provenance; a
+    # manually-created lot never fabricates one.
+    default_source_total_cost_basis = (
+        (Decimal(str(physical_quantity)) * Decimal(str(unit_cost_basis))).quantize(Decimal("0.01"))
+        if source_production_run_id is not None
+        else None
+    )
     obj = SurplusInventory(
         id=uuid.uuid4(),
         business_id=business.id,
         product_id=product.id,
-        source_production_run_id=overrides.get("source_production_run_id"),
-        physical_quantity=overrides.get("physical_quantity", 6),
-        unit_cost_basis=overrides.get("unit_cost_basis", "0.50"),
+        source_production_run_id=source_production_run_id,
+        physical_quantity=physical_quantity,
+        unit_cost_basis=unit_cost_basis,
+        source_total_cost_basis=overrides.get(
+            "source_total_cost_basis", default_source_total_cost_basis
+        ),
         produced_at=overrides.get("produced_at", datetime.now(UTC)),
         is_reusable=overrides.get("is_reusable", True),
     )

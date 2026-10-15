@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, String, Text
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, declared_attr, mapped_column, relationship
 
 from app.db.base import Base
-from app.db.columns import QUANTITY
+from app.db.columns import MONEY, QUANTITY
 from app.db.enums import SurplusTransactionType, pg_enum
 from app.db.mixins import CreatedAtMixin, TimestampMixin, VersionMixin
 
@@ -30,6 +30,20 @@ class SurplusInventory(Base, TimestampMixin, VersionMixin):
         CheckConstraint(
             "unit_cost_basis >= 0", name="ck_surplus_inventory_unit_cost_basis_non_negative"
         ),
+        CheckConstraint(
+            "source_total_cost_basis IS NULL OR source_total_cost_basis >= 0",
+            name="ck_surplus_inventory_source_total_cost_basis_non_negative",
+        ),
+        # Phase 8 Final Architecture Amendment §2 / Lock Addendum §B: a production-
+        # created lot always carries its exact, immutable origin-cost provenance; a
+        # manually-created lot never fabricates one. `source_total_cost_basis` is
+        # historical provenance from Finish — never revalued by later physical
+        # quantity changes (spoilage, manual adjustment).
+        CheckConstraint(
+            "(source_production_run_id IS NULL AND source_total_cost_basis IS NULL) "
+            "OR (source_production_run_id IS NOT NULL AND source_total_cost_basis IS NOT NULL)",
+            name="ck_surplus_inventory_source_total_cost_basis_provenance_match",
+        ),
         Index(
             "ix_surplus_inventory_business_id_product_id_usable_through_date",
             "business_id",
@@ -37,6 +51,18 @@ class SurplusInventory(Base, TimestampMixin, VersionMixin):
             "usable_through_date",
         ),
     )
+
+    # Optimistic concurrency (mirrors Product/Order/Ingredient/PurchasedProductInventory
+    # exactly — applied per-class, not on VersionMixin itself). Independent
+    # Implementation Review Remediation Plan v1: `SurplusInventory` already declared
+    # `version`/`VersionMixin` but was never wired into SQLAlchemy's own
+    # `version_id_col` mechanism, so a concurrent write that bypassed the
+    # application-level `check_version` comparison had no ORM-level `StaleDataError`
+    # backstop the way every other versioned model already gets for free. This is a
+    # pure Python/SQLAlchemy mapper declaration — no DDL, no migration.
+    @declared_attr.directive
+    def __mapper_args__(cls) -> dict:
+        return {"version_id_col": cls.version}
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     business_id: Mapped[uuid.UUID] = mapped_column(
@@ -50,6 +76,7 @@ class SurplusInventory(Base, TimestampMixin, VersionMixin):
     )
     physical_quantity: Mapped[Decimal] = mapped_column(QUANTITY, nullable=False)
     unit_cost_basis: Mapped[Decimal] = mapped_column(QUANTITY, nullable=False)
+    source_total_cost_basis: Mapped[Decimal | None] = mapped_column(MONEY)
     produced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     usable_through_date: Mapped[date | None] = mapped_column(Date)
     is_reusable: Mapped[bool] = mapped_column(Boolean, nullable=False)

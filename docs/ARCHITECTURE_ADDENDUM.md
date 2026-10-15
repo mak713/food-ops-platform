@@ -1151,6 +1151,302 @@ inventory; write a `SurplusTransaction`; write a historical `OrderCostAllocation
 `READY`/`COMPLETED` order lifecycle behavior; implement a Shopping List UI; or implement any
 Dashboard/Analytics feature. All of the above remain Phase 8+ scope.
 
-Frozen Phase 6 parent baseline: `210318d57d77554ccdde0f1fe682a10841fbca70`. Phase 7 has not yet been
-committed — no Phase 7 commit SHA is recorded here; it will be added once Phase 7 is committed and its
-own CI/freeze checkpoint is reached.
+Frozen Phase 6 parent baseline: `210318d57d77554ccdde0f1fe682a10841fbca70`. Phase 7 is committed and
+frozen at `67ac77444c13196764057784b93f94ef445c0c1c` (subject `Phase 7: operational recalculation`); that
+commit is the parent baseline for Phase 8.
+
+## Phase 8 Architecture Decisions
+
+Phase 8 (Production Execution and Surplus) decisions, approved at the Phase 8 review checkpoints
+and verified by the implementation, remediation, follow-up, and automated-acceptance passes. The
+Phase 8 scope chain is `Order → Reservation → Production → Ingredient Consumption → Cost → Output
+Allocation → Surplus → Ready`. Where a Phase 8 entry extends or corrects a Phase 7 entry, the
+earlier entry's relative-ordering and projection rules are preserved unless the entry says
+otherwise.
+
+### ADR-132 — ProductionRun Is Historical Truth at Start
+
+A `ProductionRequirement` remains a recalculable operational projection (ADR-123, ADR-126): it is
+rebuilt on every operational recalculation and is protected from that rebuild only while an
+`IN_PRODUCTION` run owns it. A `ProductionRun` is created at exactly one point — Start Production —
+and from that moment is historical execution truth, never recomputed from current state.
+
+Start executes against the requirement's *pinned* `RecipeRevision`, even when that revision is no
+longer the Recipe's current one. At Start the run snapshots: the revision and its yield; each
+participating Ingredient's planned quantity; the revision's active and elapsed timing; the
+Business's labor rate; and, per Ingredient, the planned unit-cost basis together with an explicit
+`cost_basis_source`. The basis follows ADR-131 exactly: `physical_quantity > 0` selects the
+Ingredient's Weighted Average Unit Cost (`WAC`), including a legitimate zero WAC; otherwise the
+effective replacement/latest-purchase fallback is used (`FALLBACK`); if that is also unknown, Start
+is rejected with `PRODUCTION_COST_BASIS_UNKNOWN` and no zero is ever fabricated. `cost_basis_source`
+is persisted once at Start and never re-decided at Finish, because WAC `0` with an unused fallback is
+otherwise indistinguishable from the fallback being authoritative.
+
+Start never deducts physical Ingredient inventory and never writes an Ingredient inventory
+transaction; consumption occurs only at Finish (ADR-134). At most one `IN_PRODUCTION` run may own a
+given `ProductionRequirement`, enforced by the service under lock and backed by a partial unique
+database index; a `CHECK` constraint ties a run's `status` to which of `completed_at`/`canceled_at`
+may be populated.
+
+### ADR-133 — Start Underproduction Acknowledgment
+
+The seller may override the recommended batch count. If the chosen count would not cover the
+requirement's remaining production demand, Start requires a structured, server-authoritative
+acknowledgment (`UNDERPRODUCTION_ACKNOWLEDGMENT_REQUIRED`), reusing the fingerprint protocol of
+ADR-128. The server always recomputes the batch plan and warning state itself, under its own locks,
+at the moment of the real write; the client's displayed plan is never trusted. The fingerprint is
+built from authoritative identifiers and quantities (never message text), so any change to the
+authoritative state yields a different fingerprint. A stale or mismatched acknowledgment can never
+start a run; the seller must review the *current* authoritative requirement state and acknowledge
+that before retrying. Overproduction is informational only and never gated.
+
+*Implementation note (non-normative).* A demand-affecting recalculation may legitimately replace a
+rebuildable `ProductionRequirement` row with a new UUID. A stale request aimed at the superseded
+requirement id therefore currently receives a non-disclosing `404`, because the requirement lookup
+precedes the `PRODUCTION_REQUIREMENT_CHANGED` check; automated acceptance (Test 2) recorded this
+behavior. The durable architectural rule is rejection of stale acknowledgments, not any particular
+status code or message. A more descriptive stale-requirement response in a future polish pass would
+not alter this architecture.
+
+### ADR-134 — Finish Production Is One Atomic Historical Execution Transaction
+
+Finish requires the run to be `IN_PRODUCTION` and performs, in a single transaction that either
+commits once or rolls back entirely: accept the seller's actual usable output, which may be lower
+than, equal to, or higher than the planned output; resolve actual Ingredient usage, defaulting to
+each Ingredient's planned snapshot quantity with optional per-Ingredient seller overrides (an
+override naming an Ingredient not in the run is rejected, `PRODUCTION_FINISH_UNKNOWN_INGREDIENT_OVERRIDE`);
+deduct physical Ingredient inventory by the *actual* usage and write one `PRODUCTION_CONSUMPTION`
+`InventoryTransaction` per Ingredient; compute and persist actual Ingredient, labor, and total
+production cost from the run-start snapshot bases; allocate positive output (ADR-135); write the
+historical output-allocation and cost records (ADR-136); create real excess Surplus (ADR-137);
+recalculate the remaining operational demand; and re-evaluate readiness of every affected Order
+(ADR-138, ADR-141).
+
+An Ingredient's physical quantity may become negative as a direct result of production and is never
+clamped, blocked, or compensated by a fabricated restock; the seller is shown a reconciliation
+warning (consistent with ADR-114). `actual_output_quantity` is quantized exactly once, at the
+persistence boundary, immediately after validation, and that single quantized value drives every
+subsequent branch and write; no branch ever tests a not-yet-quantized value (ADR-115). A
+sub-quantum positive input therefore takes the zero-output path rather than reaching the
+apportionment with an effectively-zero positive quantity.
+
+A zero-output Finish still consumes the actual Ingredients, still writes the consumption history,
+and still records the actual production cost, because the physical event occurred; it creates no
+output allocation, no `OrderCostAllocation`, and no Surplus, and the full unmet demand remains or
+returns as active demand.
+
+### ADR-135 — Product-Wide Completed Production Output Allocation
+
+Completed usable output is allocated Product-wide, not scoped to a `RecipeRevision` (a
+`SurplusInventory` row carries no revision either). Priority is earliest fulfillment deadline —
+date, then time with an absent time ordering after a timed item on the same date — with the
+`OrderLine` id as the final deterministic tie-break. Each line's remaining need is its
+`underlying_quantity` minus both its immutable prior completed `ProductionRunOrderAllocation`
+quantities and its active Surplus allocations, so no unit of demand is ever satisfied twice.
+
+A completed `ProductionRunOrderAllocation` is immutable historical coverage: later recalculation
+subtracts it from demand and never rewrites it. Underproduction leaves exactly the remainder as
+active demand. Continuing production is another Start against the remaining requirement and never
+creates a new customer Order.
+
+### ADR-136 — Production Cost Apportionment and the Option B Cents-Ledger Invariant
+
+This entry corrects and clarifies earlier wording that stated the recipient total as equal to the raw
+stored run total.
+
+`ProductionRun.actual_total_production_cost` is an operational-precision figure (`NUMERIC(18,6)`
+semantics) and is **not** itself reduced to cents. The historical money recipients —
+`OrderCostAllocation.amount` for each directly allocated Order line, and
+`SurplusInventory.source_total_cost_basis` for the production-created Surplus lot — are cents
+(`NUMERIC(14,2)`). The authoritative cents-ledger invariant is:
+
+`SUM(PRODUCTION OrderCostAllocation.amount for the run) + production-created Surplus.source_total_cost_basis == MONEY_QUANTIZE(ProductionRun.actual_total_production_cost)`
+
+exactly, at cents precision, where `MONEY_QUANTIZE` is the single round-half-up conversion of the
+run total to cents. The total is converted to cents once and then apportioned across *all*
+recipients — every direct Order-line allocation and the Surplus excess, when present — in one exact
+integer largest-remainder (Hamilton) pass over the recipients' quantities, so the cents shares sum
+to the target with zero residual and no recipient group is rounded independently. Recipient cents
+are never stated to equal the raw six-decimal run total, and the run total is never quantized to
+cents merely to satisfy the ledger. With zero usable output there are no recipients and nothing is
+apportioned; the run still carries its actual cost.
+
+### ADR-137 — Production-Created and Manually Recorded Surplus
+
+Expected or planned excess is never physical Surplus. Real Surplus exists only after actual finished
+output exceeds the demand it was allocated to (ADR-134/135), or after the seller explicitly records
+it. A production-created lot carries immutable historical cost provenance: `unit_cost_basis`
+(`NUMERIC(18,6)`) is the per-unit operational figure, and `source_total_cost_basis`
+(`NUMERIC(14,2)`) is the exact cents share assigned at Finish (ADR-136), non-null if and only if the
+lot has a source run (enforced by a `CHECK`). `source_total_cost_basis` is never revalued by a later
+physical-quantity change such as spoilage or a manual reduction.
+
+Whether a lot is reusable and when it expires remain seller/domain-driven: reusability defaults from
+the Product, and a default `usable_through_date` is the Business-local production date plus the
+Product's default usable days (ADR-129's Business-local semantics, never a raw UTC date). Manual
+adjustment is reduction-only; new supply, including a manual positive count, is always a new lot with
+no source run and a seller-supplied cost basis, never a top-up that would blend history into an
+existing lot. `SurplusInventory` participates in the optimistic-concurrency `version_id_col` cohort
+(ADR-104/113), in addition to the explicit version check.
+
+### ADR-138 — Whole-Order READY and Manual Custom-Item Satisfaction
+
+`READY` is derived for the entire Order and is true only when every line is satisfied. A Produced
+line requires completed `ProductionRunOrderAllocation` quantity plus active eligible Surplus
+allocation to cover its quantity. A Purchased line requires authoritative inventory coverage: the
+Product's aggregate Purchased shortage (total active reservations versus physical quantity) must be
+zero; because Purchased reservations carry no per-Order priority, no single Order is singled out when
+a shortage exists. A `CUSTOM_ITEM` line that requires manual fulfillment requires
+`manual_fulfillment_satisfied` to be true.
+
+Promotion to `READY` and demotion back to `CONFIRMED` are persisted with `ready_at` and
+`OrderStatusHistory`. Demotion occurs only through an authoritative pre-Completion loss of
+supply (for example a consequential Surplus reduction or a Purchased downward adjustment). `READY` is not `COMPLETED`; Completion
+remains out of scope. Production-affecting edits to a `READY` Order remain restricted: the
+confirmed-edit workflow accepts only `CONFIRMED` Orders. Custom Item satisfaction is the one
+seller-controlled readiness input, changed only through the dedicated
+`POST /orders/{id}/lines/{line_id}/manual-fulfillment` action, which applies only to a `CUSTOM_ITEM`
+line that requires it, only for a `CONFIRMED` or `READY` Order, and locks only the Order itself (it
+touches no Product, Ingredient, Surplus, or Purchased state). Marking a line satisfied or
+unsatisfied may promote or demote the Order.
+
+The Order response's `ready_at` and `was_ever_ready` are display/readiness fields. `was_ever_ready`
+is derived presentation state — true only for a currently `CONFIRMED` Order whose history contains a
+`READY` entry — and is not an independent lifecycle state.
+
+### ADR-139 — READY Surplus Protection Composes with Active-Run Protection
+
+An ordinary `READY` Order's Surplus allocations are promises. They are protected from ordinary FEFO
+reallocation at row/lot granularity (a line covered by several lots has each allocation row
+protected independently), subtracted from the pool the allocator sees, and netted from the
+requirement group's remaining demand so no phantom production or Ingredient reservation arises for
+already-covered quantity. Because every recalculation deletes and recreates rebuildable
+`ProductionRequirement` rows (and `SurplusAllocation.production_requirement_id` cascades), a
+protected READY allocation is preserved by cloning it, with a new id and identical lot/order/line/
+quantity, under the newly created requirement. A targeted reconciliation (ADR-140) releases only the
+allocation backed by the specifically impaired lot(s); every other lot's READY allocation stays
+fixed. Immutable completed `ProductionRun` coverage is subtracted independently (ADR-135).
+
+The active-run axis (ADR-126) is stronger and the two compose without overlap: any Surplus allocation
+whose `ProductionRequirement` is protected by an `IN_PRODUCTION` run is represented exactly once,
+through the active-run axis. It is excluded from READY cloning and rebuild machinery, is never
+double-counted against its lot, and its protected requirement is left untouched. A READY Order and
+its own still-active run can legitimately coexist (a different run's completed output may finish
+covering the Order), and subsequent recalculations must leave such an allocation unchanged.
+
+Persisted `ProductionRequirement.surplus_allocated_quantity` includes every legitimately fixed READY
+portion plus the freshly allocated portion, each counted exactly once; completed-production quantity
+is a different resource and is not part of it.
+
+### ADR-140 — Active-Run Surplus Hard Floor and Consequence Acknowledgment
+
+These are two distinct rules.
+
+*Active-run hard floor.* A manual physical Surplus reduction may never take a lot's physical quantity
+below the quantity committed to allocations of active-run-protected requirements. Such a request is
+rejected with the production-locked conflict (`SURPLUS_ADJUSTMENT_PRODUCTION_LOCKED`) before any
+mutation, with zero state change and no acknowledgment path: the only way to change that commitment is
+to finish or cancel the run.
+
+*Consequential reductions.* Any other reduction that lowers the active Surplus allocation of any
+affected `OrderLine` and/or demotes a `READY` Order requires a current structured acknowledgment
+(`SURPLUS_ADJUSTMENT_REDUCES_ALLOCATION_REQUIRES_ACKNOWLEDGMENT`, ADR-128 protocol). The server
+performs the reconciliation inside the transaction (targeted to the impaired lot, reusing the
+deterministic allocator) as its own dry run; if the acknowledged fingerprint does not match the
+complete current consequence, the transaction is rolled back and the new consequence is returned for
+renewed review. The fingerprint encodes the complete consequence — every line whose active allocation
+fell (not only `READY` lines) and every `READY` demotion — so a changed consequence invalidates a
+stale acknowledgment. Before commit, for every Surplus lot of the Product,
+`SUM(active SurplusAllocation.quantity) <= physical_quantity` is asserted; a violation is treated as
+an internal error and rolled back, never committed.
+
+### ADR-141 — Cross-Order Readiness: Discover–Lock–Verify–Bounded-Retry
+
+This entry extends and corrects ADR-124, whose Order-side sequence assumed the only Order involved is
+the directly-addressed one. It preserves ADR-124's relative Product → Recipe → Ingredient →
+Surplus/Purchased ordering.
+
+Any workflow whose recalculation can change another Order's readiness follows one protocol:
+(1) discover candidate Orders — every `CONFIRMED`/`READY` Order referencing the affected Product(s) —
+without locking; (2) include the directly-addressed Order in that same complete candidate set where
+the workflow has one, so it is never locked separately or first; (3) lock the complete Order set in
+one deterministically id-sorted phase; (4) lock the Product(s) in sorted order; (5) lock Recipe and
+Ingredient state; (6) lock the relevant Surplus and/or Purchased state; (7) re-query the candidate
+closure now that Product serialization is held; (8) if it grew, roll back the entire attempt and
+restart from a fully unlocked state, never extending a partial lock set; (9) bound the retries (three
+attempts, then a domain `409` contention error); and (10) only then mutate, recalculate, and
+re-evaluate readiness atomically.
+
+This applies to: Order confirmation; confirmed edit (discovery uses the union of the Order's
+currently persisted Products and the Products proposed by the edit); confirmed cancellation;
+Purchased-inventory restock and adjustment (the Product lock and re-verification are always
+performed, even when the first discovery finds no candidate Orders); Surplus creation and adjustment
+(which lock every Surplus lot of the Product, so a "within slack" decision is made under lock);
+Cancel Production Run; and Finish Production. Because a deadlock needs two transactions acquiring a
+shared resource in opposing orders, and every participant acquires the same discovered Order set in
+the same sorted order, none can form.
+
+Run workflows compose without a reverse cycle: Cancel and Finish lock their own `ProductionRun` row
+first, solely to serialize against each other on the same run; ordinary Order workflows never request
+a run row, so no wait cycle can include it. Start Production does not use the sibling-Order readiness
+pattern because it creates no readiness mutation: it locks Product → `ProductionRequirement` →
+Recipe → Ingredient and never an Order.
+
+### ADR-142 — Cancel Production Run Recalculates Current Operational Truth
+
+Cancel applies only to an `IN_PRODUCTION` run. Because Start consumed no Ingredient inventory
+(ADR-132), cancellation restores none and writes no consumption event. It flips the run to
+`CANCELED`, which releases the active-run protection of its requirement, recalculates the Product,
+and re-evaluates readiness of every candidate Order in the same transaction (ADR-141). A previously
+protected Surplus allocation may therefore become available to a different, higher-priority Order,
+changing readiness, without any later separate action. Cancel and Finish on the same run serialize on
+the run row, so exactly one of them takes effect.
+
+### ADR-143 — Canceling an Order After Completed Production Preserves Historical Execution
+
+Demand currently covered by an active `IN_PRODUCTION` run hard-blocks Order cancellation
+(`ORDER_PRODUCTION_LOCKED`, ADR-126). An Order covered only by *completed* production history is not
+blocked by that fact alone, but cancellation then requires the current structured consequence
+acknowledgment (`CANCELLATION_AFTER_PRODUCTION_REQUIRES_ACKNOWLEDGMENT`, ADR-128 protocol).
+Cancellation never restores Ingredients already consumed; never erases or rewrites a completed
+`ProductionRun`; never rewrites completed `ProductionRunOrderAllocation` rows or historical
+`PRODUCTION` `OrderCostAllocation` rows, which remain attached to the now-`CANCELED` Order; and never
+manufactures a replacement Surplus lot for already-completed output merely because the Order was
+canceled (the seller may record it explicitly under ADR-137). The Order's current operational claims
+— Purchased reservations and active Surplus allocations — are released through the Product
+recalculation, and other Orders' readiness is re-evaluated (ADR-141). `CONFIRMED` and `READY` Orders
+are cancelable on identical terms; `DRAFT`, `COMPLETED`, and `CANCELED` are not handled by this path.
+
+## Phase 8 Completion Status
+
+Phase 8 Production Execution and Surplus is implemented, covering the chain `Order → Reservation →
+Production → Ingredient Consumption → Cost → Output Allocation → Surplus → Ready`: Production Plan and
+Review & Start, batch override and underproduction acknowledgment, `ProductionRun` snapshotting,
+Active Runs, Cancel and Finish Production with actual Ingredient usage and consumption history,
+actual production cost, Product-wide output allocation, shortfall and continuation, Surplus
+creation/eligibility/history/manual adjustment, whole-Order READY evaluation (including Custom Item
+manual satisfaction and Purchased readiness integration), and the concurrency, tenant-isolation, and
+numeric protections those workflows require, per ADR-132 through ADR-143 above. Phase 8's parent
+baseline is the frozen Phase 7 commit `67ac77444c13196764057784b93f94ef445c0c1c`.
+
+Final verified state: backend full suite **781 passing**, with the Phase 8 concurrency suites (**34**
+real-connection tests) passing; frontend **232/232**; `ruff check` and `ruff format --check` clean;
+`alembic check` reports no schema drift; TypeScript clean; ESLint reports zero errors (9 pre-existing
+warnings); the frontend production build succeeds. Automated end-to-end acceptance —
+16 scenarios implemented as **18 Playwright tests** run against the real browser/React/FastAPI/
+PostgreSQL stack — passed in full, three consecutive full-suite runs plus a reversed-order run, with
+no unexpected 5xx response and no leaked test tenants. The acceptance harness is a deliberate local
+regression suite (`frontend/playwright.phase8.config.ts`, `frontend/e2e/phase8/`); the default
+Playwright configuration ignores it. No dependency was added, removed, or changed. Exactly one
+migration was introduced (`0e6f9a20fa8a`: run-ingredient `cost_basis_source`, the active-run unique
+index and run status/timestamp `CHECK`, and Surplus `source_total_cost_basis` with its `CHECK`s); an
+upgrade → downgrade → upgrade round trip was verified on a throwaway database. No Phase 9
+functionality was implemented.
+
+**Not included in Phase 8** (deferred to the Order Completion / Fulfillment slice and later phases):
+`READY → COMPLETED`; physical Purchased Product fulfillment; physical consumption of allocated
+Surplus; historical `PURCHASED_GOOD` fulfillment cost; historical `SURPLUS` fulfillment cost;
+`PACKAGING` historical fulfillment allocation; `CUSTOM_DIRECT` historical fulfillment allocation;
+the Shopping List UI; the Dashboard; and Analytics.
+
+No Phase 8 commit SHA is recorded here; the repository's Git history is authoritative for it.

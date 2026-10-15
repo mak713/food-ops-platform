@@ -43,6 +43,11 @@ backend/.mail-outbox/
 # Playwright
 playwright-report/
 test-results/
+# Phase 8 acceptance harness output (reports, screenshots, per-test results)
+test-artifacts/
+
+# Local agent/dev-server tooling (not part of the product)
+.claude/launch.json
 
 # Temporary files
 *.tmp

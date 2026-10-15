@@ -19,7 +19,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 from app.db.columns import MONEY, QUANTITY
-from app.db.enums import CalculationStatus, ProductionRunStatus, pg_enum
+from app.db.enums import CalculationStatus, CostBasisSource, ProductionRunStatus, pg_enum
 from app.db.mixins import CreatedAtMixin, TimestampMixin, VersionMixin
 
 if TYPE_CHECKING:
@@ -325,6 +325,27 @@ class ProductionRun(Base, TimestampMixin, VersionMixin):
             "actual_total_production_cost IS NULL OR actual_total_production_cost >= 0",
             name="ck_production_runs_actual_total_production_cost_non_negative",
         ),
+        # Phase 8 Final Architecture Lock §14 / Final Lock §F (defense-in-depth #2):
+        # ties `status` to which lifecycle timestamps may be populated. Enforced at
+        # the DB layer in addition to service-layer checks, matching the codebase's
+        # established discipline (e.g. ProductionRequirement's revision/status CHECK).
+        CheckConstraint(
+            "(status = 'IN_PRODUCTION' AND completed_at IS NULL AND canceled_at IS NULL) "
+            "OR (status = 'COMPLETED' AND completed_at IS NOT NULL AND canceled_at IS NULL) "
+            "OR (status = 'CANCELED' AND canceled_at IS NOT NULL AND completed_at IS NULL)",
+            name="ck_production_runs_status_timestamp_match",
+        ),
+        # Phase 8 Final Architecture Lock §14 (defense-in-depth #1): at most one
+        # IN_PRODUCTION run may source itself from the same ProductionRequirement —
+        # app-level check (Product lock + row-lock) plus this DB-level guarantee.
+        Index(
+            "ix_production_runs_unique_active_source",
+            "source_production_requirement_id",
+            unique=True,
+            postgresql_where=(
+                "status = 'IN_PRODUCTION' AND source_production_requirement_id IS NOT NULL"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -399,6 +420,12 @@ class ProductionRunIngredient(Base):
             name="ck_production_run_ingredients_actual_total_cost_non_negative",
         ),
     )
+    # Phase 8 Final Architecture Lock §C / Amendment: explicit discriminator for
+    # which of the two snapshot columns above was authoritative at Start — without
+    # it, WAC=0/replacement=0.12 is indistinguishable from WAC=0(unused)/
+    # replacement=0.12(authoritative). Set once at Start, never re-decided at
+    # Finish. Not overloaded onto `actual_unit_cost_basis` (that field's documented
+    # meaning is the Finish-time actual basis, not the Start-time planned selection).
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     business_id: Mapped[uuid.UUID] = mapped_column(
@@ -414,6 +441,10 @@ class ProductionRunIngredient(Base):
     actual_quantity: Mapped[Decimal | None] = mapped_column(QUANTITY)
     weighted_average_unit_cost_snapshot: Mapped[Decimal] = mapped_column(QUANTITY, nullable=False)
     replacement_unit_cost_snapshot: Mapped[Decimal | None] = mapped_column(QUANTITY)
+    cost_basis_source: Mapped[CostBasisSource] = mapped_column(
+        pg_enum(CostBasisSource, name="ck_production_run_ingredients_cost_basis_source"),
+        nullable=False,
+    )
     actual_unit_cost_basis: Mapped[Decimal | None] = mapped_column(QUANTITY)
     actual_total_cost: Mapped[Decimal | None] = mapped_column(QUANTITY)
 

@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import decimal
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -54,6 +54,7 @@ from app.db.models.production import (
     ProductionRequirement,
     ProductionRequirementOrder,
     ProductionRun,
+    ProductionRunOrderAllocation,
 )
 from app.db.models.purchased_inventory import PurchasedProductInventory
 from app.db.models.recipe import Recipe, RecipeRevision, RecipeRevisionIngredient
@@ -70,6 +71,32 @@ _CONTEXT_PRECISION = 50
 (ADR-109) — the handful of Decimal accumulations that unavoidably live at this
 service layer (summing already-isolated per-ingredient costs/quantities) run under
 this same explicit, fixed-precision context rather than the caller's ambient one."""
+
+
+@dataclass(frozen=True)
+class ReadySurplusPolicy:
+    """Governs whether a READY Order's existing `SurplusAllocation` may be released
+    back into ordinary FEFO competition during this recalculation pass (Phase 8
+    Final Architecture Lock §10, corrected by the Independent Implementation Review
+    Remediation Plan v1.2 §2). Row/lot granular, never whole-Product or whole-line:
+    only allocation rows sourced from a lot named in `impaired_lot_ids` are ever
+    released — every other READY-linked row remains fixed regardless of how many
+    other lots this same recalculation pass touches. The empty-set default
+    (`PRESERVE_READY`) is correct for every ordinary recalculation-triggering event
+    (Order confirm/edit/cancel, Finish, manual Surplus creation, Recipe migration,
+    Cancel Production Run); only the one authorized negative-Surplus physical-
+    quantity reconciliation path (`surplus_service.adjust_surplus`) ever supplies a
+    non-empty set, via `reconcile_ready_for_lots(...)` — and only for the specific
+    lot(s) whose physical quantity it is actually reducing."""
+
+    impaired_lot_ids: frozenset[uuid.UUID] = frozenset()
+
+
+PRESERVE_READY = ReadySurplusPolicy()
+
+
+def reconcile_ready_for_lots(lot_ids: Iterable[uuid.UUID]) -> ReadySurplusPolicy:
+    return ReadySurplusPolicy(impaired_lot_ids=frozenset(lot_ids))
 
 
 def _overflow_error(field: str) -> ApiError:
@@ -356,6 +383,53 @@ def get_protected_requirement_ids(
     return set(rows)
 
 
+def get_ready_surplus_protected_allocations(
+    db: Session,
+    business: Business,
+    product: Product,
+    *,
+    impaired_lot_ids: frozenset[uuid.UUID] = frozenset(),
+    active_run_protected_requirement_ids: Collection[uuid.UUID] = (),
+) -> list[SurplusAllocation]:
+    """Every active `SurplusAllocation` belonging to a currently-`READY` Order's line
+    for this Product — the READY-Surplus protection axis (Remediation Plan v1.2 §2),
+    orthogonal to and always applied alongside `IN_PRODUCTION` protection
+    (`get_protected_requirement_ids`, entirely unconditional and never affected by
+    this function or by `ready_surplus_policy`). Row-granular, not line-granular: a
+    line covered by allocation rows from multiple lots has each row independently
+    included or excluded — `impaired_lot_ids` names the lot(s) an authorized
+    negative-quantity reconciliation is currently reducing; rows sourced from those
+    lots are deliberately excluded here, becoming ordinary rebuildable demand for
+    exactly the quantity that lot can no longer be trusted to have promised, while
+    every other READY-linked row (any other lot) remains fixed.
+
+    Rows whose `production_requirement_id` is `IN_PRODUCTION`-protected are excluded
+    (`active_run_protected_requirement_ids`): the stronger active-run axis already
+    represents them exactly once (fixed against their lot, never deleted, never
+    cloned), and such a row can be READY-linked simultaneously — e.g. a READY Order
+    whose remaining demand was completed by a different run while its own
+    Surplus-covered requirement's run is still active."""
+    query = (
+        select(SurplusAllocation)
+        .join(Order, SurplusAllocation.order_id == Order.id)
+        .join(OrderLine, SurplusAllocation.order_line_id == OrderLine.id)
+        .where(
+            OrderLine.product_id == product.id,
+            OrderLine.business_id == business.id,
+            Order.business_id == business.id,
+            Order.status == OrderStatus.READY,
+            SurplusAllocation.business_id == business.id,
+        )
+    )
+    if impaired_lot_ids:
+        query = query.where(SurplusAllocation.surplus_inventory_id.not_in(impaired_lot_ids))
+    if active_run_protected_requirement_ids:
+        query = query.where(
+            SurplusAllocation.production_requirement_id.not_in(active_run_protected_requirement_ids)
+        )
+    return list(db.scalars(query))
+
+
 def get_production_locked_order_line_ids(
     db: Session, business: Business, product: Product
 ) -> set[uuid.UUID]:
@@ -509,8 +583,16 @@ def _gather_produced_demand(
     exclude_order_id: uuid.UUID | None,
     hypothetical_lines: Sequence[HypotheticalLine],
 ) -> list[tuple[OrderLine, Order]]:
-    """Every CONFIRMED OrderLine referencing this Product, at any demand_date (Plan v2
-    §2/§8 — the 'today forward' filter is deliberately absent). Preview's
+    """Every CONFIRMED or READY OrderLine referencing this Product, at any demand_date
+    (Plan v2 §2/§8 — the 'today forward' filter is deliberately absent). READY is
+    included alongside CONFIRMED (Phase 8 Final Architecture Lock Addendum §A) so a
+    READY Order's still-required Purchased reservation and active Surplus allocation
+    survive every subsequent recalculation pass until Order Completion — this is safe
+    without a separate "new production demand" exclusion because
+    `_recalculate_produced_closure` below additionally subtracts each line's already-
+    completed `ProductionRunOrderAllocation` quantity, which nets to exactly this
+    line's `underlying_quantity` for any READY line by definition (READY requires full
+    satisfaction), so it never contributes new whole-batch production demand. Preview's
     `exclude_order_id` removes that Order's own persisted contribution first (Amendment
     §4), so its hypothetical replacement lines are the only representation of that
     Order's demand for this computation."""
@@ -518,7 +600,7 @@ def _gather_produced_demand(
         OrderLine.product_id == product.id,
         OrderLine.business_id == business.id,
         Order.business_id == business.id,
-        Order.status == OrderStatus.CONFIRMED,
+        Order.status.in_((OrderStatus.CONFIRMED, OrderStatus.READY)),
     ]
     if exclude_order_id is not None:
         conditions.append(Order.id != exclude_order_id)
@@ -589,10 +671,14 @@ def recalculate_product_closure(
     exclude_order_id: uuid.UUID | None = None,
     hypothetical_lines: Sequence[HypotheticalLine] = (),
     persist: bool = True,
+    ready_surplus_policy: ReadySurplusPolicy = PRESERVE_READY,
 ) -> RecalcResult:
     """The recalculation core. `persist=False` (Draft Operational Preview only) skips
     every session mutation and returns the same computed result a real commit would —
-    Preview and Commit share this exact function (Spec §11.5)."""
+    Preview and Commit share this exact function (Spec §11.5). `ready_surplus_policy`
+    (Remediation Plan v1.2 §2) defaults to preserving every READY Order's existing
+    Surplus claim — the correct behavior for every caller except the one authorized
+    negative-Surplus reconciliation path, which supplies `reconcile_ready_for_lots(...)`."""
     protected_requirement_ids = get_protected_requirement_ids(db, business, product)
 
     if product.product_type == ProductType.PURCHASED:
@@ -615,6 +701,7 @@ def recalculate_product_closure(
         hypothetical_lines=hypothetical_lines,
         protected_requirement_ids=protected_requirement_ids,
         persist=persist,
+        ready_surplus_policy=ready_surplus_policy,
     )
 
 
@@ -705,6 +792,7 @@ def _recalculate_produced_closure(
     hypothetical_lines: Sequence[HypotheticalLine],
     protected_requirement_ids: set[uuid.UUID],
     persist: bool,
+    ready_surplus_policy: ReadySurplusPolicy = PRESERVE_READY,
 ) -> RecalcResult:
     real_lines = _gather_produced_demand(
         db,
@@ -820,15 +908,17 @@ def _recalculate_produced_closure(
                 item.order_line_id
             ].fulfillment_time
 
-    # --- Surplus allocation (line-level; fixed lot quantity excluded up front) ----
-    lots = db.scalars(
-        select(SurplusInventory).where(
-            SurplusInventory.product_id == product.id,
-            SurplusInventory.business_id == business.id,
-            SurplusInventory.is_reusable.is_(True),
-        )
-    ).all()
-
+    # --- Fixed/protected Surplus quantity (both axes, always both applied) --------
+    # Axis 1 — `IN_PRODUCTION` protection: unconditional, entirely orthogonal to
+    # `ready_surplus_policy` (Remediation Plan v1.2 §3 — an active-run-covered
+    # allocation is a hard structural floor, never reconciled via this recalculation
+    # pass at all; the only sanctioned way to change it is to finish or cancel the
+    # run itself, enforced upstream of this function by `adjust_surplus`'s own
+    # pre-check against `active_run_fixed_quantity_for_lot`).
+    demand_line_key: dict[uuid.UUID, demand_aggregation.DemandKey] = {
+        item.order_line_id: (item.product_id, item.recipe_revision_id, item.demand_date)
+        for item in rebuildable_demand
+    }
     fixed_lot_allocations: dict[uuid.UUID, Decimal] = {}
     if protected_requirement_ids:
         rows = db.execute(
@@ -844,6 +934,69 @@ def _recalculate_produced_closure(
                     fixed_lot_allocations.get(surplus_inventory_id, Decimal(0)) + quantity
                 )
 
+    # Axis 2 — READY-Surplus protection (Remediation Plan v1.2 §2): row/lot granular,
+    # gated by `ready_surplus_policy`. `PRESERVE_READY`'s empty `impaired_lot_ids`
+    # protects every READY-linked row; a targeted `reconcile_ready_for_lots(...)`
+    # excludes only the named lot(s)' rows, releasing exactly that quantity back into
+    # ordinary competition while every other lot's READY claims stay fixed.
+    ready_protected_rows = get_ready_surplus_protected_allocations(
+        db,
+        business,
+        product,
+        impaired_lot_ids=ready_surplus_policy.impaired_lot_ids,
+        active_run_protected_requirement_ids=protected_requirement_ids,
+    )
+    fixed_ready_quantity_by_line: dict[uuid.UUID, Decimal] = {}
+    ready_protected_rows_by_line: dict[uuid.UUID, list[SurplusAllocation]] = {}
+    with decimal.localcontext() as ctx:
+        ctx.prec = _CONTEXT_PRECISION
+        for alloc in ready_protected_rows:
+            fixed_lot_allocations[alloc.surplus_inventory_id] = (
+                fixed_lot_allocations.get(alloc.surplus_inventory_id, Decimal(0)) + alloc.quantity
+            )
+            fixed_ready_quantity_by_line[alloc.order_line_id] = (
+                fixed_ready_quantity_by_line.get(alloc.order_line_id, Decimal(0)) + alloc.quantity
+            )
+            ready_protected_rows_by_line.setdefault(alloc.order_line_id, []).append(alloc)
+
+    # Per-line completed-`ProductionRunOrderAllocation` quantity (Phase 8 Final
+    # Architecture Lock Addendum §A) — computed once here as the single source of
+    # truth, used for two distinct purposes: (1) immediately below, to shrink what
+    # this pass asks the Surplus allocator to compete for (a line already
+    # physically produced and immutably allocated should never cause the allocator
+    # to over-consume Surplus on its behalf); (2) the group-level `already_satisfied`
+    # term further down, to correctly net completed production out of remaining
+    # whole-batch demand. These are two different questions sharing one fact, not a
+    # double-subtraction (Remediation Plan v1.2 §2's explicit implementation guard).
+    all_rebuildable_line_ids = [item.order_line_id for item in rebuildable_demand]
+    completed_quantity_by_line: dict[uuid.UUID, Decimal] = {}
+    if all_rebuildable_line_ids:
+        completed_rows = db.execute(
+            select(
+                ProductionRunOrderAllocation.order_line_id, ProductionRunOrderAllocation.quantity
+            ).where(
+                ProductionRunOrderAllocation.order_line_id.in_(all_rebuildable_line_ids),
+                ProductionRunOrderAllocation.business_id == business.id,
+            )
+        ).all()
+        with decimal.localcontext() as ctx:
+            ctx.prec = _CONTEXT_PRECISION
+            for order_line_id, quantity in completed_rows:
+                completed_quantity_by_line[order_line_id] = (
+                    completed_quantity_by_line.get(order_line_id, Decimal(0)) + quantity
+                )
+
+    # --- Surplus allocation (line-level; fixed/protected/completed quantity excluded
+    # up front — every rebuildable line is fed to the allocator only for its
+    # genuinely-still-open remainder, never its full `underlying_quantity`) ---------
+    lots = db.scalars(
+        select(SurplusInventory).where(
+            SurplusInventory.product_id == product.id,
+            SurplusInventory.business_id == business.id,
+            SurplusInventory.is_reusable.is_(True),
+        )
+    ).all()
+
     domain_lots = [
         surplus_allocation_domain.SurplusLot(
             surplus_inventory_id=lot.id,
@@ -855,33 +1008,40 @@ def _recalculate_produced_closure(
         )
         for lot in lots
     ]
-    domain_demand_items = [
-        surplus_allocation_domain.DemandItem(
-            order_id=(
-                line_lookup[item.order_line_id][1].id
-                if item.order_line_id in line_lookup
-                else next(
-                    h.order_id for h in hypothetical_lines if h.order_line_id == item.order_line_id
+    domain_demand_items = []
+    with decimal.localcontext() as ctx:
+        ctx.prec = _CONTEXT_PRECISION
+        for item in rebuildable_demand:
+            protected = fixed_ready_quantity_by_line.get(
+                item.order_line_id, Decimal(0)
+            ) + completed_quantity_by_line.get(item.order_line_id, Decimal(0))
+            released_quantity = item.quantity - protected
+            if released_quantity <= 0:
+                continue  # fully covered by protected/completed supply already
+            domain_demand_items.append(
+                surplus_allocation_domain.DemandItem(
+                    order_id=(
+                        line_lookup[item.order_line_id][1].id
+                        if item.order_line_id in line_lookup
+                        else next(
+                            h.order_id
+                            for h in hypothetical_lines
+                            if h.order_line_id == item.order_line_id
+                        )
+                    ),
+                    order_line_id=item.order_line_id,
+                    product_id=item.product_id,
+                    recipe_revision_id=item.recipe_revision_id,
+                    quantity=released_quantity,
+                    demand_date=item.demand_date,
+                    fulfillment_time=fulfillment_time_by_line_id.get(item.order_line_id),
                 )
-            ),
-            order_line_id=item.order_line_id,
-            product_id=item.product_id,
-            recipe_revision_id=item.recipe_revision_id,
-            quantity=item.quantity,
-            demand_date=item.demand_date,
-            fulfillment_time=fulfillment_time_by_line_id.get(item.order_line_id),
-        )
-        for item in rebuildable_demand
-    ]
+            )
     allocation_results = surplus_allocation_domain.allocate_surplus(
         domain_lots, domain_demand_items, today=business_today
     )
     surplus_allocated_by_key: dict[demand_aggregation.DemandKey, Decimal] = {}
     surplus_rows_to_create: list[SurplusAllocation] = []
-    demand_line_key: dict[uuid.UUID, demand_aggregation.DemandKey] = {
-        item.order_line_id: (item.product_id, item.recipe_revision_id, item.demand_date)
-        for item in rebuildable_demand
-    }
     with decimal.localcontext() as ctx:
         ctx.prec = _CONTEXT_PRECISION
         for result in allocation_results:
@@ -905,6 +1065,36 @@ def _recalculate_produced_closure(
                     )
                 )
 
+    # --- Completed direct-production-allocation quantity, per group (Phase 8 Final
+    # Architecture Lock Addendum §A): derived from `completed_quantity_by_line`
+    # (computed once, above) — every unit already physically produced and immutably
+    # allocated to a line must net out of this pass's whole-batch demand exactly the
+    # same way an active Surplus allocation already does — otherwise a READY (or
+    # partially-completed CONFIRMED) line would resurrect new production demand for
+    # quantity that has already been produced and delivered. Never re-queried — a
+    # single source of truth for this fact (Remediation Plan v1.2 §2's guard).
+    completed_allocation_by_key: dict[demand_aggregation.DemandKey, Decimal] = {}
+    with decimal.localcontext() as ctx:
+        ctx.prec = _CONTEXT_PRECISION
+        for order_line_id, quantity in completed_quantity_by_line.items():
+            key = demand_line_key[order_line_id]
+            completed_allocation_by_key[key] = (
+                completed_allocation_by_key.get(key, Decimal(0)) + quantity
+            )
+
+    # --- Fixed READY-Surplus quantity, per group (Remediation Plan v1.2 §2): the
+    # protected (unaffected-lot) portion of every READY line's allocation, grouped
+    # the same way `completed_allocation_by_key` already is — folded into
+    # `already_satisfied` below so a protected READY line's demand never resurrects
+    # phantom production/Ingredient-reservation demand, exactly like completed
+    # production already doesn't.
+    fixed_surplus_by_key: dict[demand_aggregation.DemandKey, Decimal] = {}
+    with decimal.localcontext() as ctx:
+        ctx.prec = _CONTEXT_PRECISION
+        for order_line_id, quantity in fixed_ready_quantity_by_line.items():
+            key = demand_line_key[order_line_id]
+            fixed_surplus_by_key[key] = fixed_surplus_by_key.get(key, Decimal(0)) + quantity
+
     # --- Per-(revision, date) group: whole-batch, ingredient requirements, cost ----
     missing_recipe = False
     all_new_requirements: list[ProductionRequirement] = []
@@ -920,8 +1110,24 @@ def _recalculate_produced_closure(
     for key, confirmed_quantity in grouped_demand.items():
         _, revision_id, demand_date = key
         surplus_for_group = surplus_allocated_by_key.get(key, Decimal(0))
+        completed_for_group = completed_allocation_by_key.get(key, Decimal(0))
+        fixed_surplus_for_group = fixed_surplus_by_key.get(key, Decimal(0))
+        with decimal.localcontext() as ctx:
+            ctx.prec = _CONTEXT_PRECISION
+            already_satisfied = surplus_for_group + completed_for_group + fixed_surplus_for_group
+            # `surplus_allocated_quantity` (persisted below) is a reporting/UI figure
+            # meaning "total Surplus quantity currently committed to this group's
+            # demand" — it must include a READY-protected line's FIXED contribution
+            # (Remediation Plan v1.2 §2), not only whatever the allocator freshly
+            # computed this pass, or a group containing a protected line would
+            # under-report real Surplus coverage by exactly that fixed amount.
+            # `completed_for_group` is deliberately excluded here (unchanged from
+            # before this remediation round): completed direct-production allocation
+            # is a different resource category from Surplus entirely, tracked via
+            # `ProductionRunOrderAllocation`, not this field.
+            total_surplus_for_group = surplus_for_group + fixed_surplus_for_group
         remaining_demand = demand_aggregation.calculate_shortage(
-            confirmed_quantity, surplus_for_group
+            confirmed_quantity, already_satisfied
         )
 
         requirement_id = uuid.uuid4()
@@ -948,7 +1154,7 @@ def _recalculate_produced_closure(
                     confirmed_quantity, field="confirmed_demand_quantity"
                 ),
                 surplus_allocated_quantity=_persist_numeric_18_6(
-                    surplus_for_group, field="surplus_allocated_quantity"
+                    total_surplus_for_group, field="surplus_allocated_quantity"
                 ),
                 production_demand_quantity=_persist_numeric_18_6(
                     remaining_demand, field="production_demand_quantity"
@@ -1114,7 +1320,7 @@ def _recalculate_produced_closure(
                     confirmed_quantity, field="confirmed_demand_quantity"
                 ),
                 surplus_allocated_quantity=_persist_numeric_18_6(
-                    surplus_for_group, field="surplus_allocated_quantity"
+                    total_surplus_for_group, field="surplus_allocated_quantity"
                 ),
                 production_demand_quantity=_persist_numeric_18_6(
                     remaining_demand, field="production_demand_quantity"
@@ -1191,6 +1397,26 @@ def _recalculate_produced_closure(
         for surplus_row in surplus_rows_to_create:
             if lines_by_key[key] and surplus_row.order_line_id in lines_by_key[key]:
                 surplus_row.production_requirement_id = requirement_id
+        # Protected READY-Surplus rows (Remediation Plan v1.2 §2) are cloned — new
+        # id, identical lot/order/line/quantity — into this group's freshly-minted
+        # requirement id: the old row is left to cascade-delete along with the old
+        # requirement it pointed at (`SurplusAllocation.production_requirement_id`
+        # is `ondelete="CASCADE"`), and this clone is its structurally-identical
+        # replacement, created in the same transaction/flush. Deterministic, never
+        # re-run through the allocator — no re-sort/tie-break risk.
+        for order_line_id in lines_by_key.get(key, []):
+            for protected_row in ready_protected_rows_by_line.get(order_line_id, []):
+                surplus_rows_to_create.append(
+                    SurplusAllocation(
+                        id=uuid.uuid4(),
+                        business_id=business.id,
+                        surplus_inventory_id=protected_row.surplus_inventory_id,
+                        production_requirement_id=requirement_id,
+                        order_id=protected_row.order_id,
+                        order_line_id=protected_row.order_line_id,
+                        quantity=protected_row.quantity,
+                    )
+                )
 
     # --- Ingredient reservation reconciliation + cross-Product shortage ----------
     ingredient_shortages: list[IngredientShortageResult] = []

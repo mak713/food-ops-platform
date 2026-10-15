@@ -233,6 +233,17 @@ class OrderConfirmRequest(BaseModel):
 
 class OrderCancelRequest(BaseModel):
     version: int
+    acknowledged_warning_fingerprint: str | None = None
+
+
+class OrderLineManualFulfillmentRequest(BaseModel):
+    """Phase 8 (Independent Implementation Review Remediation Plan v1/v1.2, Finding
+    4) — the seller-controlled action that sets a one-off `CUSTOM_ITEM` line's
+    `manual_fulfillment_satisfied` flag. The only supported mutation path for that
+    field; it is never accepted via `OrderLineInput` (Order create/edit)."""
+
+    version: int
+    satisfied: bool
 
 
 class OperationalWarningResponse(BaseModel):
@@ -428,6 +439,13 @@ class OrderResponse(BaseModel):
     # write path independently re-checks the authoritative active-run condition
     # under its own operational lock regardless of what this field reports.
     production_locked: bool = False
+    # Phase 8: when this became READY (cleared on demotion back to CONFIRMED) —
+    # advisory display only, matching confirmed_at/canceled_at's shape.
+    ready_at: datetime | None = None
+    # Phase 8: derived, non-persisted — true only for a currently-CONFIRMED order
+    # that has a recorded READY entry in its OrderStatusHistory, distinguishing
+    # "was Ready, now demoted" from "never yet satisfied" for UI attention.
+    was_ever_ready: bool = False
 
 
 class OrderSummary(BaseModel):

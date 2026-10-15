@@ -59,6 +59,17 @@ class ProductionRunStatus(enum.StrEnum):
     CANCELED = "CANCELED"
 
 
+class CostBasisSource(enum.StrEnum):
+    """Which run-start Ingredient cost branch was authoritative (Phase 8 Final
+    Architecture Lock §C / Amendment): WAC when physical_quantity > 0 at Start
+    (even when that WAC is legitimately 0), FALLBACK when the effective
+    replacement/latest-purchase fallback supplied the basis instead. Persisted
+    once at Start and never re-decided at Finish."""
+
+    WAC = "WAC"
+    FALLBACK = "FALLBACK"
+
+
 class SurplusTransactionType(enum.StrEnum):
     PRODUCTION_OUTPUT = "PRODUCTION_OUTPUT"
     ORDER_FULFILLMENT = "ORDER_FULFILLMENT"

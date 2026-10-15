@@ -75,6 +75,12 @@ export interface Order {
   // Phase 7: derived, non-persisted, read-time-only — advisory for UI gating.
   // Never trusted for correctness; every write path re-checks authoritatively.
   production_locked: boolean;
+  // Phase 8: set when every line's demand is fully covered (produced, purchased,
+  // or surplus-allocated); cleared on demotion back to CONFIRMED or on cancel.
+  ready_at: string | null;
+  // Phase 8: true only while CONFIRMED and previously Ready — surfaces a demotion
+  // notice distinct from an order that was never yet fully covered.
+  was_ever_ready: boolean;
 }
 
 export interface OrderSummary {
@@ -163,6 +169,18 @@ export interface OrderConfirmRequest {
 
 export interface OrderCancelRequest {
   version: number;
+  // Phase 8 (Final Architecture Amendment): required to proceed past a
+  // CANCELLATION_AFTER_PRODUCTION_REQUIRES_ACKNOWLEDGMENT rejection — echoes back
+  // the server-issued fingerprint from that rejection's issue details, unmodified.
+  acknowledged_warning_fingerprint?: string | null;
+}
+
+// Phase 8 Remediation (Finding 4) — the only supported mutation path for a
+// CUSTOM_ITEM line's manual_fulfillment_satisfied flag; never accepted via
+// OrderLineInput (create/edit).
+export interface OrderLineManualFulfillmentRequest {
+  version: number;
+  satisfied: boolean;
 }
 
 export interface OperationalWarning {
@@ -276,6 +294,11 @@ export const ordersApi = {
     post<Order>(`/api/v1/orders/${id}/confirm`, payload),
   cancel: (id: string, payload: OrderCancelRequest) =>
     post<Order>(`/api/v1/orders/${id}/cancel`, payload),
+  setLineManualFulfillment: (
+    id: string,
+    lineId: string,
+    payload: OrderLineManualFulfillmentRequest,
+  ) => post<Order>(`/api/v1/orders/${id}/lines/${lineId}/manual-fulfillment`, payload),
   preview: (payload: OrderCreateRequest) =>
     post<OperationalPreviewResponse>("/api/v1/orders/preview", payload),
   previewExisting: (id: string, payload: OrderCreateRequest) =>

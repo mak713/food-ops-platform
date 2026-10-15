@@ -102,6 +102,52 @@ def _run_service_version_race(real_session_factory, run_update, row_id, business
     return results
 
 
+def _run_product_locked_service_version_race(real_session_factory, run_update, row_id, business_id):
+    """Runs `run_update(db, business, row_id)` in two threads, like
+    `_run_service_version_race`, but for a resource whose service-layer mutation now
+    unconditionally acquires a `Product` row lock before it can reach its own commit
+    (Independent Implementation Review Remediation Plan v1.2, Finding 6 — the
+    empty-candidate-order-set locking fix withdrew the old "no lock when no candidate
+    Orders exist" shortcut). Forcing both threads to rendezvous at `db.commit()` (the
+    technique `_run_service_version_race` uses) would deadlock here: the second thread
+    blocks acquiring the Product lock — a genuine Postgres `SELECT ... FOR UPDATE` wait
+    — before it can ever reach its own commit call, while the first thread's commit is
+    paused waiting for a rendezvous the second thread is structurally unable to reach.
+
+    No artificial commit-time synchronization is needed here: the Product lock itself
+    is now the genuine DB-level serialization point. A start barrier is enough to
+    guarantee both threads genuinely attempt the race concurrently — correctness
+    (exactly one winner, the other cleanly rejected via the ORM-level
+    `StaleDataError` -> `commit_or_raise_stale` translation, since the loser's
+    in-memory row was read, pre-lock, at the old version) is then guaranteed by
+    Postgres's own row lock regardless of the precise interleaving."""
+    results: list[tuple[str, object]] = []
+    start_barrier = threading.Barrier(2)
+
+    def _attempt() -> None:
+        db = real_session_factory()
+        try:
+            start_barrier.wait(timeout=5)
+            business = db.get(Business, business_id)
+            run_update(db, business, row_id)
+            results.append(("ok", None))
+        except ApiError as exc:
+            db.rollback()
+            results.append(("api_error", exc))
+        except Exception as exc:  # noqa: BLE001 - capturing for assertion, not swallowing
+            db.rollback()
+            results.append(("error", exc))
+        finally:
+            db.close()
+
+    threads = [threading.Thread(target=_attempt) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    return results
+
+
 def _cleanup_business_graph(real_session_factory, *, row_model, row_id, business_id, owner_id):
     cleanup = real_session_factory()
     try:
@@ -358,10 +404,20 @@ def test_service_layer_concurrent_ingredient_restock_translates_to_stale_version
 def test_service_layer_concurrent_purchased_inventory_restock_translates_to_stale_version_api_error(
     real_session_factory,
 ):
-    """Phase 5 Plan §G: an ordinary Restock against an *already-existing*
-    `PurchasedProductInventory` row takes no Product lock at all (that lock is reserved
-    for the row's own creation) — this proves `version_id_col`, freshly wired onto this
-    model for Phase 5, alone prevents a lost update under genuine concurrency."""
+    """Phase 5 Plan §G, corrected by Independent Implementation Review Remediation Plan
+    v1.2 Finding 6: an ordinary Restock against an *already-existing*
+    `PurchasedProductInventory` row now unconditionally acquires a `Product` row lock
+    (the old "no lock when no candidate Orders exist" shortcut was withdrawn — it left
+    a genuine TOCTOU race where a concurrent Order confirmation could commit new demand
+    for this Product without ever being observed). The `check_version` pre-check still
+    runs beforehand against an unlocked read, so it cannot by itself catch this race
+    (both threads can pass it, having each read before either commits) — it is
+    `version_id_col`'s ORM-level `StaleDataError`, translated by
+    `commit_or_raise_stale`, that must catch the loser once it's finally unblocked by
+    the winner's commit and attempts to persist against a row whose version has since
+    moved. Uses `_run_product_locked_service_version_race`, not the shared
+    commit-barrier helper, because the two threads now genuinely serialize at the
+    Product lock rather than racing at commit time."""
     setup_db = real_session_factory()
     try:
         business = make_business_graph(setup_db)
@@ -385,7 +441,7 @@ def test_service_layer_concurrent_purchased_inventory_restock_translates_to_stal
         purchased_inventory_service.restock_purchased_product(db, business, row_id, payload)
 
     try:
-        results = _run_service_version_race(
+        results = _run_product_locked_service_version_race(
             real_session_factory, run_update, product_id, business_id
         )
         oks = [r for kind, r in results if kind == "ok"]

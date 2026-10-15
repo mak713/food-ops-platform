@@ -2348,6 +2348,164 @@ describe("Order Detail — Phase 7 lifecycle actions (Finding 8)", () => {
   });
 });
 
+const READY_ORDER = {
+  ...CONFIRMED_ORDER,
+  status: "READY",
+  ready_at: "2026-02-01T14:30:00Z",
+};
+
+describe("Order Detail — Phase 8 READY status and cancellation (Final Architecture Amendment/Addendum)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("shows the Ready badge and ready-since message, and allows Cancel but hides Edit", async () => {
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, READY_ORDER),
+      },
+    ]);
+
+    renderAt("/app/orders/o1");
+    await screen.findByRole("heading", { name: "ORD-ABCDEF012345" });
+
+    expect(await screen.findByText("READY")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Ready" })).toBeInTheDocument();
+    expect(screen.getByText(/fully covered — ready since/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel Order" })).toBeEnabled();
+    expect(screen.queryByRole("link", { name: "Edit" })).not.toBeInTheDocument();
+  });
+
+  it("shows the demotion-attention notice for a Confirmed order that was previously Ready", async () => {
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, { ...CONFIRMED_ORDER, was_ever_ready: true }),
+      },
+    ]);
+
+    renderAt("/app/orders/o1");
+    await screen.findByRole("heading", { name: "ORD-ABCDEF012345" });
+
+    expect(
+      await screen.findByText(/previously ready but no longer fully covers its demand/i),
+    ).toBeInTheDocument();
+  });
+
+  it("shows no demotion-attention notice for a Confirmed order that was never Ready", async () => {
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, { ...CONFIRMED_ORDER, was_ever_ready: false }),
+      },
+    ]);
+
+    renderAt("/app/orders/o1");
+    await screen.findByRole("heading", { name: "ORD-ABCDEF012345" });
+    await screen.findByRole("heading", { name: "Confirmed" });
+
+    expect(
+      screen.queryByText(/previously ready but no longer fully covers its demand/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("cancels a purchased-only Ready order with no acknowledgment needed", async () => {
+    let cancelCallCount = 0;
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, READY_ORDER),
+      },
+      {
+        method: "POST",
+        pattern: /\/api\/v1\/orders\/o1\/cancel$/,
+        respond: (_url, init) => {
+          cancelCallCount += 1;
+          const body = JSON.parse(init?.body as string);
+          expect(body.acknowledged_warning_fingerprint).toBeNull();
+          return jsonResponse(200, { ...READY_ORDER, status: "CANCELED" });
+        },
+      },
+    ]);
+
+    renderAt("/app/orders/o1");
+    await screen.findByRole("heading", { name: "ORD-ABCDEF012345" });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel Order" }));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Cancel order" }));
+    });
+
+    await waitFor(() => expect(cancelCallCount).toBe(1));
+  });
+
+  it("shows the post-production cancellation warning and resubmits with the acknowledged fingerprint", async () => {
+    let cancelCallCount = 0;
+    mockFetchRouter([
+      {
+        method: "GET",
+        pattern: /\/api\/v1\/orders\/o1$/,
+        respond: () => jsonResponse(200, CONFIRMED_ORDER),
+      },
+      {
+        method: "POST",
+        pattern: /\/api\/v1\/orders\/o1\/cancel$/,
+        respond: (_url, init) => {
+          cancelCallCount += 1;
+          const body = JSON.parse(init?.body as string);
+          if (!body.acknowledged_warning_fingerprint) {
+            return jsonResponse(409, {
+              error: {
+                code: "CANCELLATION_AFTER_PRODUCTION_REQUIRES_ACKNOWLEDGMENT",
+                message: "This order has completed production history that will not be reversed.",
+                issues: [
+                  {
+                    severity: "WARNING",
+                    code: "CANCELLATION_AFTER_PRODUCTION",
+                    message:
+                      "This order has completed production history that will not be reversed.",
+                    field: null,
+                    resource: "order",
+                    details: { fingerprint: "CANCEL_AFTER_PRODUCTION:o1:1" },
+                  },
+                ],
+              },
+            });
+          }
+          expect(body.acknowledged_warning_fingerprint).toBe("CANCEL_AFTER_PRODUCTION:o1:1");
+          return jsonResponse(200, { ...CONFIRMED_ORDER, status: "CANCELED" });
+        },
+      },
+    ]);
+
+    renderAt("/app/orders/o1");
+    await screen.findByRole("heading", { name: "ORD-ABCDEF012345" });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel Order" }));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Cancel order" }));
+    });
+
+    expect(
+      await screen.findByText(/completed production history that will not be reversed/i),
+    ).toBeInTheDocument();
+    const cancelAnyway = screen.getByRole("button", { name: /cancel anyway/i });
+
+    await act(async () => {
+      fireEvent.click(cancelAnyway);
+    });
+
+    await waitFor(() => expect(cancelCallCount).toBe(2));
+  });
+});
+
 describe("Order Detail — CANCELED order Payment UX boundary (Final Hardening §5)", () => {
   afterEach(() => vi.unstubAllGlobals());
 

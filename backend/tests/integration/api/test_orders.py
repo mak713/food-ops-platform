@@ -1839,3 +1839,160 @@ def test_preview_missing_fulfillment_time_warns_for_purchased_only_order(client)
     codes = [w["code"] for w in body["warnings"]]
     assert "MISSING_FULFILLMENT_TIME" in codes
     assert len(body["warning_fingerprints"]) >= 1
+
+
+def test_was_ever_ready_distinguishes_demoted_from_never_satisfied(client, session):
+    """Phase 8 (Final Architecture Lock §10 + Amendment): `was_ever_ready` is a
+    read-time-only computed field — true only for a currently-CONFIRMED order with a
+    recorded READY entry in its OrderStatusHistory, letting the UI show a demotion
+    notice distinct from an order that was simply never yet satisfied. `ready_at`
+    alone can't carry this distinction since it's cleared on demotion (Amendment §A)."""
+    from datetime import UTC, datetime
+
+    from app.db.enums import OrderStatus
+    from app.db.models.business import Business
+
+    signup(client)
+    business = session.scalars(select(Business).where(Business.name == "Test Bakery")).one()
+    product, option = _create_product_with_option(client)
+
+    never_ready = client.post(
+        "/api/v1/orders",
+        json={"lines": [_standard_option_line(product, option)]},
+        headers=csrf_headers(client),
+    ).json()
+    demoted = client.post(
+        "/api/v1/orders",
+        json={"lines": [_standard_option_line(product, option)]},
+        headers=csrf_headers(client),
+    ).json()
+
+    never_ready_row = session.get(Order, never_ready["id"])
+    never_ready_row.status = OrderStatus.CONFIRMED
+    demoted_row = session.get(Order, demoted["id"])
+    demoted_row.status = OrderStatus.CONFIRMED
+    session.add(
+        OrderStatusHistory(
+            business_id=business.id,
+            order_id=demoted_row.id,
+            from_status=OrderStatus.CONFIRMED,
+            to_status=OrderStatus.READY,
+            changed_at=datetime.now(UTC),
+        )
+    )
+    session.commit()
+
+    never_ready_response = client.get(f"/api/v1/orders/{never_ready['id']}")
+    assert never_ready_response.json()["was_ever_ready"] is False
+
+    demoted_response = client.get(f"/api/v1/orders/{demoted['id']}")
+    assert demoted_response.json()["was_ever_ready"] is True
+
+    # Scoped to CONFIRMED only — a currently-READY order reports False here too,
+    # since its own `ready_at` already covers that presentation.
+    demoted_row.status = OrderStatus.READY
+    session.commit()
+    ready_response = client.get(f"/api/v1/orders/{demoted['id']}")
+    assert ready_response.json()["was_ever_ready"] is False
+
+
+def test_set_line_manual_fulfillment_promotes_and_demotes_via_http(client, session):
+    """Independent Implementation Review Remediation Plan v1/v1.2, Finding 4 — the
+    only supported mutation path for a CUSTOM_ITEM line's
+    manual_fulfillment_satisfied, end-to-end through the HTTP route."""
+    signup(client)
+    created = client.post(
+        "/api/v1/orders",
+        json={"lines": [_custom_item_line()]},
+        headers=csrf_headers(client),
+    ).json()
+    line_id = created["lines"][0]["id"]
+
+    order = client.patch(
+        f"/api/v1/orders/{created['id']}",
+        json={
+            "version": created["version"],
+            "lines": [
+                {
+                    "id": line_id,
+                    "line_type": "CUSTOM_ITEM",
+                    "underlying_quantity": "3",
+                    "charged_unit_price": "10.00",
+                    "display_name": "Custom cake topper",
+                }
+            ],
+            "fulfillment_date": "2026-06-01",
+            "fulfillment_time": "09:00:00",
+        },
+        headers=csrf_headers(client),
+    ).json()
+    confirmed = client.post(
+        f"/api/v1/orders/{created['id']}/confirm",
+        json={"version": order["version"], "acknowledged_warning_fingerprints": []},
+        headers=csrf_headers(client),
+    ).json()
+    assert confirmed["status"] == "CONFIRMED"  # not yet READY -- unsatisfied
+
+    satisfied = client.post(
+        f"/api/v1/orders/{created['id']}/lines/{line_id}/manual-fulfillment",
+        json={"version": confirmed["version"], "satisfied": True},
+        headers=csrf_headers(client),
+    )
+    assert satisfied.status_code == 200, satisfied.text
+    assert satisfied.json()["status"] == "READY"
+    line = next(line for line in satisfied.json()["lines"] if line["id"] == line_id)
+    assert line["manual_fulfillment_satisfied"] is True
+
+    unsatisfied = client.post(
+        f"/api/v1/orders/{created['id']}/lines/{line_id}/manual-fulfillment",
+        json={"version": satisfied.json()["version"], "satisfied": False},
+        headers=csrf_headers(client),
+    )
+    assert unsatisfied.status_code == 200, unsatisfied.text
+    assert unsatisfied.json()["status"] == "CONFIRMED"
+
+
+def test_set_line_manual_fulfillment_rejects_line_not_requiring_it(client):
+    """A CUSTOM_ITEM line with `manual_fulfillment_required=False` has no meaning
+    for this action, just like any other line type would not."""
+    signup(client)
+    created = client.post(
+        "/api/v1/orders",
+        json={"lines": [_custom_item_line(manual_fulfillment_required=False)]},
+        headers=csrf_headers(client),
+    ).json()
+    line_id = created["lines"][0]["id"]
+
+    order = client.patch(
+        f"/api/v1/orders/{created['id']}",
+        json={
+            "version": created["version"],
+            "lines": [
+                {
+                    "id": line_id,
+                    "line_type": "CUSTOM_ITEM",
+                    "underlying_quantity": "3",
+                    "charged_unit_price": "10.00",
+                    "display_name": "Custom cake topper",
+                    "manual_fulfillment_required": False,
+                }
+            ],
+            "fulfillment_date": "2026-06-01",
+            "fulfillment_time": "09:00:00",
+        },
+        headers=csrf_headers(client),
+    ).json()
+    confirmed = client.post(
+        f"/api/v1/orders/{created['id']}/confirm",
+        json={"version": order["version"], "acknowledged_warning_fingerprints": []},
+        headers=csrf_headers(client),
+    ).json()
+    assert confirmed["status"] == "READY"  # no manual fulfillment required -- trivially satisfied
+
+    response = client.post(
+        f"/api/v1/orders/{created['id']}/lines/{line_id}/manual-fulfillment",
+        json={"version": confirmed["version"], "satisfied": True},
+        headers=csrf_headers(client),
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "LINE_NOT_MANUAL_FULFILLMENT"

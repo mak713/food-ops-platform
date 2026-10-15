@@ -11,9 +11,11 @@ from app.api.v1.customers import router as customers_router
 from app.api.v1.ingredient_inventory import router as ingredient_inventory_router
 from app.api.v1.ingredients import router as ingredients_router
 from app.api.v1.orders import router as orders_router
+from app.api.v1.production_runs import router as production_runs_router
 from app.api.v1.products import router as products_router
 from app.api.v1.purchased_inventory import list_router as purchased_inventory_list_router
 from app.api.v1.purchased_inventory import router as purchased_inventory_router
+from app.api.v1.surplus import router as surplus_router
 from app.core.api_errors import register_api_error_handlers
 from app.core.config import get_settings
 from app.core.errors import register_exception_handlers
@@ -56,6 +58,10 @@ app.include_router(
     prefix="/api/v1/purchased-inventory",
     tags=["purchased-inventory"],
 )
+app.include_router(
+    production_runs_router, prefix="/api/v1/production-runs", tags=["production-runs"]
+)
+app.include_router(surplus_router, prefix="/api/v1/surplus", tags=["surplus"])
 
 
 @app.get("/health")

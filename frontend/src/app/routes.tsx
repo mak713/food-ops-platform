@@ -39,6 +39,14 @@ import { RecipeCreatePage } from "../features/products/RecipeCreatePage";
 import { RecipeEditPage } from "../features/products/RecipeEditPage";
 import { RecipeHistoryPage } from "../features/products/RecipeHistoryPage";
 import { RecipeRevisionDetailPage } from "../features/products/RecipeRevisionDetailPage";
+import { ProductionPlanPage } from "../features/production/ProductionPlanPage";
+import { ProductionRunDetailPage } from "../features/production/ProductionRunDetailPage";
+import { ProductionRunListPage } from "../features/production/ProductionRunListPage";
+import { StartProductionPage } from "../features/production/StartProductionPage";
+import { SurplusAdjustPage } from "../features/surplus/SurplusAdjustPage";
+import { SurplusCreatePage } from "../features/surplus/SurplusCreatePage";
+import { SurplusHistoryPage } from "../features/surplus/SurplusHistoryPage";
+import { SurplusListPage } from "../features/surplus/SurplusListPage";
 
 // Phase 2 establishes the real authenticated app shell (Spec §12.2): every route under
 // /app is gated by ProtectedRoute, which derives auth state from the server-managed
@@ -77,6 +85,12 @@ function AppLayout() {
           </Link>
           <Link to="/app/inventory" className="text-muted-foreground hover:text-foreground">
             Inventory
+          </Link>
+          <Link to="/app/production" className="text-muted-foreground hover:text-foreground">
+            Production
+          </Link>
+          <Link to="/app/surplus" className="text-muted-foreground hover:text-foreground">
+            Surplus
           </Link>
           <Link to="/app/account" className="text-muted-foreground hover:text-foreground">
             Account
@@ -195,6 +209,14 @@ export const routes: RouteObject[] = [
           { path: "orders/new", element: <OrderEntryPage /> },
           { path: "orders/:id", element: <OrderDetailPage /> },
           { path: "orders/:id/edit", element: <OrderEntryPage /> },
+          { path: "production", element: <ProductionPlanPage /> },
+          { path: "production/start/:requirementId", element: <StartProductionPage /> },
+          { path: "production/runs", element: <ProductionRunListPage /> },
+          { path: "production/runs/:id", element: <ProductionRunDetailPage /> },
+          { path: "surplus", element: <SurplusListPage /> },
+          { path: "surplus/new", element: <SurplusCreatePage /> },
+          { path: "surplus/:id/adjust", element: <SurplusAdjustPage /> },
+          { path: "surplus/:id/history", element: <SurplusHistoryPage /> },
         ],
       },
     ],

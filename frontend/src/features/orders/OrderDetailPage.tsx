@@ -100,7 +100,19 @@ export function OrderDetailPage() {
     onSuccess: invalidate,
   });
   const cancelMutation = useMutation({
-    mutationFn: () => ordersApi.cancel(id as string, { version: query.data!.version }),
+    mutationFn: (acknowledgedFingerprint: string | null) =>
+      ordersApi.cancel(id as string, {
+        version: query.data!.version,
+        acknowledged_warning_fingerprint: acknowledgedFingerprint,
+      }),
+    onSuccess: invalidate,
+  });
+  const manualFulfillmentMutation = useMutation({
+    mutationFn: ({ lineId, satisfied }: { lineId: string; satisfied: boolean }) =>
+      ordersApi.setLineManualFulfillment(id as string, lineId, {
+        version: query.data!.version,
+        satisfied,
+      }),
     onSuccess: invalidate,
   });
 
@@ -115,9 +127,16 @@ export function OrderDetailPage() {
         ? confirmMutation.error.body?.error.message
         : "Something went wrong confirming the order. Please try again."
       : undefined;
+  const cancellationAfterProductionIssue =
+    cancelMutation.error instanceof ApiError &&
+    cancelMutation.error.body?.error.code === "CANCELLATION_AFTER_PRODUCTION_REQUIRES_ACKNOWLEDGMENT"
+      ? cancelMutation.error.body.error.issues[0]
+      : undefined;
   const cancelGenericError =
-    cancelMutation.isError && cancelMutation.error instanceof ApiError
-      ? cancelMutation.error.body?.error.message
+    cancelMutation.isError && !cancellationAfterProductionIssue
+      ? cancelMutation.error instanceof ApiError
+        ? cancelMutation.error.body?.error.message
+        : "Something went wrong canceling the order. Please try again."
       : undefined;
 
   const handleConfirmAnyway = () => {
@@ -290,15 +309,45 @@ export function OrderDetailPage() {
                     {line.notes && <p className="text-xs text-muted-foreground">{line.notes}</p>}
                     {/* Internal-only Custom Item detail — visually separate (muted,
                         boxed) from the customer-facing Qty/Price/Subtotal columns
-                        (Checkpoint-3 correction 18). No manual_fulfillment_satisfied
-                        control — Phase 6 never exposes one. */}
+                        (Checkpoint-3 correction 18). Phase 8 Remediation (Finding 4)
+                        adds the seller-controlled manual_fulfillment_satisfied
+                        toggle, shown only while it has any effect on readiness
+                        (CONFIRMED/READY) and only for a line that actually requires
+                        it. */}
                     {line.line_type === "CUSTOM_ITEM" && (
-                      <div className="mt-1 flex flex-wrap gap-1">
+                      <div className="mt-1 flex flex-wrap items-center gap-1">
                         <Badge variant={line.manual_fulfillment_required ? "outline" : "secondary"}>
                           {line.manual_fulfillment_required
                             ? "Manual fulfillment required"
                             : "No manual fulfillment"}
                         </Badge>
+                        {line.manual_fulfillment_required && (
+                          <Badge variant={line.manual_fulfillment_satisfied ? "default" : "outline"}>
+                            {line.manual_fulfillment_satisfied ? "Satisfied" : "Not satisfied"}
+                          </Badge>
+                        )}
+                        {line.manual_fulfillment_required &&
+                          (order.status === "CONFIRMED" || order.status === "READY") && (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              disabled={
+                                manualFulfillmentMutation.isPending &&
+                                manualFulfillmentMutation.variables?.lineId === line.id
+                              }
+                              onClick={() =>
+                                manualFulfillmentMutation.mutate({
+                                  lineId: line.id,
+                                  satisfied: !line.manual_fulfillment_satisfied,
+                                })
+                              }
+                            >
+                              {line.manual_fulfillment_satisfied
+                                ? "Mark unsatisfied"
+                                : "Mark satisfied"}
+                            </Button>
+                          )}
                         {line.custom_direct_cost_estimate && (
                           <Badge variant="outline">
                             Internal cost est. ${line.custom_direct_cost_estimate}
@@ -323,6 +372,13 @@ export function OrderDetailPage() {
               ))}
             </TableBody>
           </Table>
+          {manualFulfillmentMutation.isError && (
+            <p role="alert" className="text-sm text-destructive">
+              {manualFulfillmentMutation.error instanceof ApiError
+                ? manualFulfillmentMutation.error.body?.error.message
+                : "Something went wrong updating manual fulfillment. Please try again."}
+            </p>
+          )}
         </section>
 
         <section className="flex flex-col gap-3">
@@ -467,9 +523,20 @@ export function OrderDetailPage() {
           </section>
         )}
 
-        {order.status === "CONFIRMED" && (
+        {(order.status === "CONFIRMED" || order.status === "READY") && (
           <section className="rounded-md border border-dashed p-3 text-sm">
-            <h2 className="mb-1 font-semibold">Confirmed</h2>
+            <h2 className="mb-1 font-semibold">{order.status === "READY" ? "Ready" : "Confirmed"}</h2>
+            {order.status === "READY" && order.ready_at && (
+              <p className="mb-2 text-green-700">
+                ✓ Fully covered — ready since {new Date(order.ready_at).toLocaleString()}.
+              </p>
+            )}
+            {order.status === "CONFIRMED" && order.was_ever_ready && (
+              <p className="mb-2 text-amber-700">
+                ⚠ This order was previously Ready but no longer fully covers its demand — review
+                before it's expected to go out.
+              </p>
+            )}
             {order.production_locked ? (
               <p className="mb-2 text-amber-700">
                 Some of this order's demand is covered by an active production run. It cannot be
@@ -479,18 +546,28 @@ export function OrderDetailPage() {
                 change, regardless of what this notice reports.
               </p>
             ) : null}
+
             {cancelGenericError && (
               <p role="alert" className="mb-2 text-sm text-destructive">
                 {cancelGenericError}
               </p>
             )}
+
             <div className="flex items-center gap-2">
-              <Link
-                to={`/app/orders/${order.id}/edit`}
-                className={buttonVariants({ variant: "outline", size: "sm" })}
-              >
-                Edit
-              </Link>
+              {order.status === "CONFIRMED" && (
+                <Link
+                  to={`/app/orders/${order.id}/edit`}
+                  className={buttonVariants({ variant: "outline", size: "sm" })}
+                >
+                  Edit
+                </Link>
+              )}
+              {/* AlertDialogAction never auto-closes the dialog (it's a plain Button, not
+                  AlertDialogPrimitive.Close) — a failed Cancel attempt leaves it open, which is
+                  exactly what the post-production acknowledgment flow needs: on a
+                  CANCELLATION_AFTER_PRODUCTION_REQUIRES_ACKNOWLEDGMENT rejection, the dialog
+                  swaps to a second confirmation state in place rather than closing and losing
+                  the warning behind its own overlay. */}
               <AlertDialog>
                 <AlertDialogTrigger
                   className={buttonVariants({ variant: "destructive", size: "sm" })}
@@ -499,22 +576,53 @@ export function OrderDetailPage() {
                   Cancel Order
                 </AlertDialogTrigger>
                 <AlertDialogContent>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>Cancel this order?</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      This releases any reserved ingredients, purchased stock, and surplus
-                      allocated to it. This cannot be undone.
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>Keep order</AlertDialogCancel>
-                    <AlertDialogAction
-                      className={buttonVariants({ variant: "destructive" })}
-                      onClick={() => cancelMutation.mutate()}
-                    >
-                      Cancel order
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
+                  {cancellationAfterProductionIssue ? (
+                    <>
+                      <AlertDialogHeader>
+                        <AlertDialogTitle>This order has completed production history</AlertDialogTitle>
+                        <AlertDialogDescription>
+                          {cancellationAfterProductionIssue.message} Canceling will not restore
+                          consumed ingredients or reverse the recorded production cost — that
+                          history is preserved permanently. Any reserved purchased stock or
+                          unconsumed surplus allocated to this order will be released.
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel>Keep order</AlertDialogCancel>
+                        <AlertDialogAction
+                          className={buttonVariants({ variant: "destructive" })}
+                          disabled={cancelMutation.isPending}
+                          onClick={() =>
+                            cancelMutation.mutate(
+                              cancellationAfterProductionIssue.details.fingerprint as string,
+                            )
+                          }
+                        >
+                          Cancel anyway
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </>
+                  ) : (
+                    <>
+                      <AlertDialogHeader>
+                        <AlertDialogTitle>Cancel this order?</AlertDialogTitle>
+                        <AlertDialogDescription>
+                          This releases any reserved ingredients, purchased stock, and surplus
+                          allocated to it. This cannot be undone.
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel>Keep order</AlertDialogCancel>
+                        <AlertDialogAction
+                          className={buttonVariants({ variant: "destructive" })}
+                          disabled={cancelMutation.isPending}
+                          onClick={() => cancelMutation.mutate(null)}
+                        >
+                          Cancel order
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </>
+                  )}
                 </AlertDialogContent>
               </AlertDialog>
             </div>

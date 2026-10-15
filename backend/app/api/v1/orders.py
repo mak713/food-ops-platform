@@ -16,12 +16,13 @@ from typing import Annotated
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_business, require_csrf
 from app.db.enums import OrderStatus
 from app.db.models.business import Business
-from app.db.models.order import Order, OrderLine, Payment
+from app.db.models.order import Order, OrderLine, OrderStatusHistory, Payment
 from app.db.session import get_db
 from app.domain import order_pricing
 from app.schemas.common import PageResponse
@@ -35,6 +36,7 @@ from app.schemas.order import (
     OrderConfirmedEditRequest,
     OrderConfirmRequest,
     OrderCreateRequest,
+    OrderLineManualFulfillmentRequest,
     OrderLineResponse,
     OrderResponse,
     OrderSummary,
@@ -100,8 +102,25 @@ def _to_response(order: Order, *, db: Session, business: Business) -> OrderRespo
     )
     production_locked = bool(
         order_lifecycle_service.get_order_production_locked_line_ids(db, business, order)
-        if order.status is OrderStatus.CONFIRMED
+        if order.status in (OrderStatus.CONFIRMED, OrderStatus.READY)
         else False
+    )
+    # Phase 8: derived, non-persisted, read-time-only — advisory for UI gating, same
+    # category as `production_locked` above. Lets the CONFIRMED-status UI distinguish
+    # "never yet satisfied" from "was Ready, then demoted" without a new persisted
+    # flag; `ready_at` alone can't do this since it's cleared on demotion.
+    was_ever_ready = (
+        order.status is OrderStatus.CONFIRMED
+        and db.scalar(
+            select(OrderStatusHistory.id)
+            .where(
+                OrderStatusHistory.order_id == order.id,
+                OrderStatusHistory.business_id == business.id,
+                OrderStatusHistory.to_status == OrderStatus.READY,
+            )
+            .limit(1)
+        )
+        is not None
     )
 
     return OrderResponse(
@@ -137,6 +156,8 @@ def _to_response(order: Order, *, db: Session, business: Business) -> OrderRespo
             for issue in issues
         ],
         production_locked=production_locked,
+        ready_at=order.ready_at,
+        was_ever_ready=was_ever_ready,
     )
 
 
@@ -413,5 +434,25 @@ def cancel_order(
         order_id,
         expected_version=payload.version,
         business_today=_business_today(business),
+        acknowledged_warning_fingerprint=payload.acknowledged_warning_fingerprint,
+    )
+    return _to_response(order, db=db, business=business)
+
+
+@router.post("/{order_id}/lines/{line_id}/manual-fulfillment", dependencies=[Depends(require_csrf)])
+def set_line_manual_fulfillment(
+    order_id: uuid.UUID,
+    line_id: uuid.UUID,
+    payload: OrderLineManualFulfillmentRequest,
+    business: Annotated[Business, Depends(get_current_business)],
+    db: Annotated[Session, Depends(get_db)],
+) -> OrderResponse:
+    order = order_lifecycle_service.set_custom_item_manual_fulfillment(
+        db,
+        business,
+        order_id,
+        line_id,
+        expected_version=payload.version,
+        satisfied=payload.satisfied,
     )
     return _to_response(order, db=db, business=business)

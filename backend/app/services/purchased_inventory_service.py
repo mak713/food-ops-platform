@@ -29,6 +29,7 @@ from app.core.api_errors import ApiError
 from app.core.tenant import check_version, commit_or_raise_stale
 from app.db.enums import ProductType, PurchasedInventoryTransactionType
 from app.db.models.business import Business
+from app.db.models.order import Order
 from app.db.models.product import Product
 from app.db.models.purchased_inventory import (
     PurchasedProductInventory,
@@ -47,7 +48,60 @@ from app.schemas.inventory import (
     PurchasedRestockRequest,
     ReplacementCostRequest,
 )
+from app.services import readiness_service
 from app.services.product_service import get_product_for_business, get_product_for_business_locked
+
+_MAX_DISCOVERY_RETRIES = 3
+
+
+class _CandidateOrderSetGrew(Exception):
+    """Internal-only retry signal (Phase 8 Final Architecture Lock §11's discover-
+    lock-verify-retry protocol, reused here exactly as
+    `production_run_service.finish_production` uses it) — never surfaced to a
+    caller."""
+
+
+def _lock_candidate_orders_and_product(
+    db: Session, business: Business, product_id: uuid.UUID
+) -> dict[uuid.UUID, Order]:
+    """Discover-lock-verify-retry (Phase 8 Final Architecture Lock §11/Final
+    Architecture Amendment §B, corrected by Independent Implementation Review
+    Remediation Plan v1.1 §6/Finding 6, "empty-S0 discovery/retry correctness"): every
+    CONFIRMED/READY Order referencing this Product is locked, sorted, BEFORE the
+    Product lock — never a new Order lock acquired after Product is already held.
+    Raises `_CandidateOrderSetGrew` if the candidate set grew between discovery and
+    the Product lock; the caller must roll back and retry from a fully unlocked
+    state.
+
+    **No empty-S0 shortcut** (withdrawn — Finding 6): the Product lock and the S1
+    re-verification are now always performed, even when the initial non-locking
+    discovery finds zero candidate Orders. The earlier "cheap-path bypass" skipped
+    the Product lock entirely whenever S0 was empty, which is race-unsafe: a
+    concurrent Order confirmation can commit new demand for this Product between
+    that empty read and the physical mutation, and the restock/adjustment would
+    never observe, recalculate, or reevaluate readiness for it. Proving the set is
+    still empty *under* the Product lock is the only way to safely take the
+    no-Order path — only the WORK afterward (there is none to do when S1 is also
+    empty) is ever skipped, never the locking itself."""
+    candidate_ids_s0 = readiness_service.discover_candidate_order_ids(db, business, product_id)
+    locked_orders = {
+        o.id: o
+        for o in db.scalars(
+            select(Order)
+            .where(Order.id.in_(candidate_ids_s0), Order.business_id == business.id)
+            .order_by(Order.id)
+            .with_for_update()
+        )
+    }
+
+    get_product_for_business_locked(db, product_id, business)
+
+    candidate_ids_s1 = readiness_service.discover_candidate_order_ids(db, business, product_id)
+    if not set(candidate_ids_s1).issubset(locked_orders.keys()):
+        raise _CandidateOrderSetGrew()
+
+    return locked_orders
+
 
 _INVENTORY_IDENTITY_CONSTRAINT = "uq_purchased_product_inventory_business_id_product_id"
 
@@ -229,7 +283,29 @@ def restock_purchased_product(
       check finds the row and rejects immediately with `409
       PURCHASED_INVENTORY_STATE_CHANGED`, directing the caller to resubmit with the
       current version — it never reaches the lock/creation path at all.
+
+    The existing-row path additionally runs the discover-lock-verify-retry readiness
+    hook (Phase 8 Final Architecture Lock §11/Final Architecture Amendment §B): a
+    restock may newly satisfy previously-unsatisfied demand, so every CONFIRMED/READY
+    Order referencing this Product is locked and reevaluated for promotion in the same
+    transaction, atomically with the physical mutation.
     """
+    for _attempt in range(_MAX_DISCOVERY_RETRIES):
+        try:
+            return _restock_purchased_product_attempt(db, business, product_id, payload)
+        except _CandidateOrderSetGrew:
+            db.rollback()
+            continue
+    raise ApiError(
+        409,
+        "PURCHASED_INVENTORY_RESTOCK_CONTENTION",
+        "Too many concurrent changes to this product's demand; please retry.",
+    )
+
+
+def _restock_purchased_product_attempt(
+    db: Session, business: Business, product_id: uuid.UUID, payload: PurchasedRestockRequest
+) -> PurchasedProductInventory:
     product = get_product_for_business(db, product_id, business)
     _require_purchased_type(product)
     existing = _fetch_inventory_row(db, business, product)
@@ -240,7 +316,15 @@ def restock_purchased_product(
             raise _state_changed_error()
         _require_active(product, action="restocking")
         check_version(existing, payload.version, resource="purchased_product_inventory")
-        return _apply_restock_to_existing_row(db, business, existing, payload)
+
+        locked_orders = _lock_candidate_orders_and_product(db, business, product_id)
+        inventory = _apply_restock_to_existing_row(db, business, existing, payload)
+        if locked_orders:
+            db.flush()  # the mutation must be visible before readiness reevaluation
+            for order in locked_orders.values():
+                readiness_service.evaluate_and_apply_readiness(db, business, order)
+        commit_or_raise_stale(db, resource="purchased_product_inventory")
+        return inventory
 
     # version is None — the caller asserts "no row exists yet."
     if existing is not None:
@@ -338,7 +422,12 @@ def _apply_restock_to_existing_row(
             notes=payload.notes,
         )
     )
-    commit_or_raise_stale(db, resource="purchased_product_inventory")
+    # No explicit flush here: the caller commits once, either directly (cheap path,
+    # no outstanding demand — preserves the original barrier-safe commit timing that
+    # `test_optimistic_concurrency.py` depends on, where the UPDATE is only ever
+    # emitted as part of `commit()`'s own autoflush) or after a conditional flush
+    # immediately before readiness reevaluation, only when that reevaluation is
+    # actually about to run.
     return inventory
 
 
@@ -352,7 +441,31 @@ def adjust_purchased_product(
     approval decision 6). Purchased Product Inventory's `physical_quantity` carries a
     hard DB `CHECK (>= 0)` — this pre-validates that same condition to produce a clean
     `422` before the CHECK could ever fire (ADR-103-style narrow-IntegrityError
-    discipline: the pre-check is the primary error surface, the CHECK is the backstop)."""
+    discipline: the pre-check is the primary error surface, the CHECK is the backstop).
+
+    Runs the discover-lock-verify-retry readiness hook (Phase 8 Final Architecture
+    Lock §11/Final Architecture Amendment §B): an upward adjustment may newly satisfy
+    previously-unsatisfied demand (promotion); a downward adjustment may make a
+    previously-satisfied READY Order insufficient again (demotion, an "authoritative
+    fulfillment state becoming insufficient" event). Every CONFIRMED/READY Order
+    referencing this Product is locked and reevaluated, atomically with the mutation.
+    """
+    for _attempt in range(_MAX_DISCOVERY_RETRIES):
+        try:
+            return _adjust_purchased_product_attempt(db, business, product_id, payload)
+        except _CandidateOrderSetGrew:
+            db.rollback()
+            continue
+    raise ApiError(
+        409,
+        "PURCHASED_INVENTORY_ADJUSTMENT_CONTENTION",
+        "Too many concurrent changes to this product's demand; please retry.",
+    )
+
+
+def _adjust_purchased_product_attempt(
+    db: Session, business: Business, product_id: uuid.UUID, payload: PurchasedAdjustmentRequest
+) -> PurchasedProductInventory:
     product = get_product_for_business(db, product_id, business)
     _require_purchased_type(product)
     inventory = _fetch_inventory_row(db, business, product)
@@ -374,6 +487,8 @@ def adjust_purchased_product(
             "is not permitted.",
         )
 
+    locked_orders = _lock_candidate_orders_and_product(db, business, product_id)
+
     inventory.physical_quantity = new_quantity
     db.add(
         PurchasedProductInventoryTransaction(
@@ -386,6 +501,10 @@ def adjust_purchased_product(
             notes=payload.notes,
         )
     )
+    if locked_orders:
+        db.flush()  # the mutation must be visible before readiness reevaluation
+        for order in locked_orders.values():
+            readiness_service.evaluate_and_apply_readiness(db, business, order)
     commit_or_raise_stale(db, resource="purchased_product_inventory")
     return inventory
 
