@@ -23,7 +23,11 @@ import {
 export const BASE = "http://localhost:5173";
 // Outside the frontend/ tree on purpose: Vite watches frontend/ and full-reloads the page
 // whenever Playwright writes trace .html resources there.
-export const ARTIFACTS = path.resolve(import.meta.dirname, "../../../test-artifacts/phase8");
+// A later phase's acceptance suite reuses this harness and points the evidence elsewhere
+// via E2E_ARTIFACTS_DIR (set by its own Playwright config); unset, behavior is unchanged.
+export const ARTIFACTS = process.env.E2E_ARTIFACTS_DIR
+  ? path.resolve(process.env.E2E_ARTIFACTS_DIR)
+  : path.resolve(import.meta.dirname, "../../../test-artifacts/phase8");
 const PASSWORD = "correct horse battery staple";
 const TZ = "America/New_York";
 

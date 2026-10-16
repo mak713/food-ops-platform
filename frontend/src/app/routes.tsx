@@ -13,6 +13,7 @@ import { SignupPage } from "../features/auth/SignupPage";
 import { CustomerDetailPage } from "../features/customers/CustomerDetailPage";
 import { CustomerFormPage } from "../features/customers/CustomerFormPage";
 import { CustomerListPage } from "../features/customers/CustomerListPage";
+import { DashboardPage } from "../features/dashboard/DashboardPage";
 import { IngredientAdjustPage } from "../features/ingredients/IngredientAdjustPage";
 import { IngredientDetailPage } from "../features/ingredients/IngredientDetailPage";
 import { IngredientFormPage } from "../features/ingredients/IngredientFormPage";
@@ -42,6 +43,7 @@ import { RecipeRevisionDetailPage } from "../features/products/RecipeRevisionDet
 import { ProductionPlanPage } from "../features/production/ProductionPlanPage";
 import { ProductionRunDetailPage } from "../features/production/ProductionRunDetailPage";
 import { ProductionRunListPage } from "../features/production/ProductionRunListPage";
+import { ShoppingListPage } from "../features/production/ShoppingListPage";
 import { StartProductionPage } from "../features/production/StartProductionPage";
 import { SurplusAdjustPage } from "../features/surplus/SurplusAdjustPage";
 import { SurplusCreatePage } from "../features/surplus/SurplusCreatePage";
@@ -52,7 +54,8 @@ import { SurplusListPage } from "../features/surplus/SurplusListPage";
 // /app is gated by ProtectedRoute, which derives auth state from the server-managed
 // session (GET /api/v1/auth/me) — never from anything client-stored. Every other module
 // under §12.2 (Orders, Production, Customers, ...) is added when the phase that owns it
-// begins.
+// begins. Phase 9 replaces the Dashboard placeholder with the real Dashboard and adds the
+// Shopping List under Production.
 
 function AppLayout() {
   const { me, clearMe } = useAuth();
@@ -89,6 +92,12 @@ function AppLayout() {
           <Link to="/app/production" className="text-muted-foreground hover:text-foreground">
             Production
           </Link>
+          <Link
+            to="/app/production/shopping-list"
+            className="text-muted-foreground hover:text-foreground"
+          >
+            Shopping List
+          </Link>
           <Link to="/app/surplus" className="text-muted-foreground hover:text-foreground">
             Surplus
           </Link>
@@ -108,20 +117,6 @@ function AppLayout() {
       <main className="flex-1 p-8">
         <Outlet />
       </main>
-    </div>
-  );
-}
-
-function DashboardPage() {
-  const { me } = useAuth();
-  return (
-    <div>
-      <h1 className="text-xl font-semibold">Dashboard — coming soon</h1>
-      {me && (
-        <p className="mt-2 text-sm text-muted-foreground">
-          Logged in as {me.user.name} ({me.user.email}) — {me.business.name}
-        </p>
-      )}
     </div>
   );
 }
@@ -211,6 +206,7 @@ export const routes: RouteObject[] = [
           { path: "orders/:id/edit", element: <OrderEntryPage /> },
           { path: "production", element: <ProductionPlanPage /> },
           { path: "production/start/:requirementId", element: <StartProductionPage /> },
+          { path: "production/shopping-list", element: <ShoppingListPage /> },
           { path: "production/runs", element: <ProductionRunListPage /> },
           { path: "production/runs/:id", element: <ProductionRunDetailPage /> },
           { path: "surplus", element: <SurplusListPage /> },

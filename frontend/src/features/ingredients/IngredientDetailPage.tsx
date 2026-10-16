@@ -110,6 +110,9 @@ export function IngredientDetailPage() {
   // a later phase, real production consumption); this never blocks anything, it only
   // makes the state visible rather than rendering a bare negative number unremarked.
   const isNegativeBalance = Number(ingredient.physical_quantity) < 0;
+  // Display-only flag: the backend derives Available (physical − reserved); a negative value
+  // simply means confirmed demand currently exceeds stock on hand.
+  const isOverReserved = Number(ingredient.available_quantity) < 0;
   // Display-only heuristic for whether to offer "Initial Balance" instead of assuming
   // Restock is always the first action — the backend's own one-time-only rule (whether
   // any InventoryTransaction has ever been created) is the actual source of truth.
@@ -155,6 +158,19 @@ export function IngredientDetailPage() {
             </dd>
           </div>
           <div>
+            <dt className="text-muted-foreground">Reserved for confirmed demand</dt>
+            <dd>
+              {formatDecimal(ingredient.reserved_quantity)} {ingredient.canonical_unit}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">Available</dt>
+            <dd className={isOverReserved ? "font-medium text-destructive" : undefined}>
+              {formatDecimal(ingredient.available_quantity)} {ingredient.canonical_unit}
+              {isOverReserved && " (reservations exceed stock — see Shopping List)"}
+            </dd>
+          </div>
+          <div>
             <dt className="text-muted-foreground">Weighted-average unit cost</dt>
             <dd>{formatDecimal(ingredient.weighted_average_unit_cost)}</dd>
           </div>
@@ -186,6 +202,11 @@ export function IngredientDetailPage() {
             </dd>
           </div>
         </dl>
+        <p className="text-xs text-muted-foreground">
+          Reserved and available quantities are derived from confirmed production demand — they
+          are not editable. Physical stock changes only through restocks, adjustments, and
+          production.
+        </p>
 
         <div className="flex flex-wrap items-center gap-3 text-sm">
           {neverInitialized && ingredient.is_active && (

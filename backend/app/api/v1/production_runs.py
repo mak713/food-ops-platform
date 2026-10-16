@@ -28,8 +28,11 @@ from app.schemas.production import (
     ProductionRunIngredientResponse,
     ProductionRunResponse,
     ProductionStartRequest,
+    RequirementAffectedOrderResponse,
+    RequirementIngredientNeedResponse,
 )
 from app.services import production_run_service
+from app.services.requirement_insight_service import RequirementInsight, build_requirement_insights
 
 router = APIRouter()
 
@@ -138,7 +141,10 @@ def list_production_runs(
     )
 
 
-def _requirement_to_response(req: ProductionRequirement) -> ProductionRequirementResponse:
+def _requirement_to_response(
+    req: ProductionRequirement, insight: RequirementInsight | None = None
+) -> ProductionRequirementResponse:
+    insight = insight or RequirementInsight()
     return ProductionRequirementResponse(
         id=str(req.id),
         product_id=str(req.product_id),
@@ -158,6 +164,30 @@ def _requirement_to_response(req: ProductionRequirement) -> ProductionRequiremen
         estimated_ingredient_cost=req.estimated_ingredient_cost,
         estimated_labor_cost=req.estimated_labor_cost,
         estimated_direct_production_cost=req.estimated_direct_production_cost,
+        has_shortage=insight.has_shortage,
+        ingredient_needs=[
+            RequirementIngredientNeedResponse(
+                ingredient_id=str(n.ingredient_id),
+                ingredient_name=n.ingredient_name,
+                canonical_unit=n.canonical_unit,
+                required_quantity=n.required_quantity,
+                physical_quantity=n.physical_quantity,
+                shortage_quantity=n.shortage_quantity,
+            )
+            for n in insight.ingredient_needs
+        ],
+        affected_orders=[
+            RequirementAffectedOrderResponse(
+                order_id=str(o.order_id),
+                order_number=o.order_number,
+                status=o.status,
+                customer_name=o.customer_name,
+                fulfillment_date=o.fulfillment_date,
+                fulfillment_time=o.fulfillment_time,
+                demand_quantity=o.demand_quantity,
+            )
+            for o in insight.affected_orders
+        ],
     )
 
 
@@ -173,8 +203,12 @@ def list_production_requirements(
     items, total = production_run_service.list_production_requirements_for_business(
         db, business, limit=limit, offset=offset
     )
+    insights = build_requirement_insights(db, business, items)
     return PageResponse(
-        items=[_requirement_to_response(r) for r in items], total=total, limit=limit, offset=offset
+        items=[_requirement_to_response(r, insights.get(r.id)) for r in items],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -185,7 +219,8 @@ def get_production_requirement(
     db: Annotated[Session, Depends(get_db)],
 ) -> ProductionRequirementResponse:
     requirement = get_owned_or_404(db, ProductionRequirement, requirement_id, business)
-    return _requirement_to_response(requirement)
+    insights = build_requirement_insights(db, business, [requirement])
+    return _requirement_to_response(requirement, insights.get(requirement.id))
 
 
 @router.get("/{production_run_id}")

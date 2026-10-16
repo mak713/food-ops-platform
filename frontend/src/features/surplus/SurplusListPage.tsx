@@ -38,6 +38,8 @@ export function SurplusListPage() {
             <TableRow>
               <TableHead>Product</TableHead>
               <TableHead>Physical quantity</TableHead>
+              <TableHead>Allocated</TableHead>
+              <TableHead>Available</TableHead>
               <TableHead>Unit cost basis</TableHead>
               <TableHead>Source</TableHead>
               <TableHead>Usable through</TableHead>
@@ -50,6 +52,8 @@ export function SurplusListPage() {
               <TableRow key={lot.id}>
                 <TableCell>{lot.product_name}</TableCell>
                 <TableCell>{formatQuantityForDisplay(lot.physical_quantity)}</TableCell>
+                <TableCell>{formatQuantityForDisplay(lot.allocated_quantity)}</TableCell>
+                <TableCell>{formatQuantityForDisplay(lot.available_quantity)}</TableCell>
                 <TableCell>${lot.unit_cost_basis}</TableCell>
                 <TableCell>
                   <Badge variant={lot.source_production_run_id ? "default" : "outline"}>

@@ -11,6 +11,10 @@ export interface SurplusInventory {
   product_name: string;
   source_production_run_id: string | null;
   physical_quantity: string;
+  // Phase 9 (Spec §7.3, SUR-003): derived by the backend — `allocated` is the sum of active
+  // allocations (current promises, not consumption); `available = physical − allocated`.
+  allocated_quantity: string;
+  available_quantity: string;
   unit_cost_basis: string;
   source_total_cost_basis: string | null;
   produced_at: string;

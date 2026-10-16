@@ -73,6 +73,8 @@ const FLOUR = {
   is_active: true,
   version: 1,
   physical_quantity: "0.000000",
+  reserved_quantity: "0.000000",
+  available_quantity: "0.000000",
   weighted_average_unit_cost: "0.000000",
   latest_purchase_unit_cost: null,
   replacement_unit_cost: null,

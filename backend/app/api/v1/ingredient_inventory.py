@@ -59,7 +59,7 @@ def create_initial_balance(
     ingredient = ingredient_inventory_service.create_initial_balance(
         db, business, ingredient_id, payload
     )
-    return ingredient_to_response(ingredient)
+    return ingredient_to_response(ingredient, db=db, business=business)
 
 
 @router.post("/{ingredient_id}/inventory/restock", dependencies=[Depends(require_csrf)])
@@ -72,7 +72,7 @@ def restock_ingredient(
     ingredient = ingredient_inventory_service.restock_ingredient(
         db, business, ingredient_id, payload
     )
-    return ingredient_to_response(ingredient)
+    return ingredient_to_response(ingredient, db=db, business=business)
 
 
 @router.post("/{ingredient_id}/inventory/adjustments", dependencies=[Depends(require_csrf)])
@@ -85,7 +85,7 @@ def adjust_ingredient(
     ingredient = ingredient_inventory_service.adjust_ingredient(
         db, business, ingredient_id, payload
     )
-    return ingredient_to_response(ingredient)
+    return ingredient_to_response(ingredient, db=db, business=business)
 
 
 @router.put("/{ingredient_id}/inventory/replacement-cost", dependencies=[Depends(require_csrf)])
@@ -98,7 +98,7 @@ def set_replacement_cost(
     ingredient = ingredient_inventory_service.set_replacement_cost(
         db, business, ingredient_id, payload
     )
-    return ingredient_to_response(ingredient)
+    return ingredient_to_response(ingredient, db=db, business=business)
 
 
 @router.get("/{ingredient_id}/inventory/transactions")

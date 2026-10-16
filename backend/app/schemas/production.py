@@ -4,7 +4,7 @@ Final Architecture Lock §5/§6/§12)."""
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 
 from pydantic import BaseModel
@@ -73,6 +73,27 @@ class ProductionFinishResponse(BaseModel):
     is_shortfall: bool
 
 
+class RequirementIngredientNeedResponse(BaseModel):
+    ingredient_id: str
+    ingredient_name: str
+    canonical_unit: str
+    required_quantity: Decimal
+    physical_quantity: Decimal
+    shortage_quantity: Decimal
+    """Cumulative shortage of this Ingredient through the requirement's demand date —
+    the same ADR-130 derivation the Shopping List uses (Spec §20.13)."""
+
+
+class RequirementAffectedOrderResponse(BaseModel):
+    order_id: str
+    order_number: str
+    status: str
+    customer_name: str | None
+    fulfillment_date: date | None
+    fulfillment_time: time | None
+    demand_quantity: Decimal
+
+
 class ProductionRequirementResponse(BaseModel):
     id: str
     product_id: str
@@ -92,3 +113,8 @@ class ProductionRequirementResponse(BaseModel):
     estimated_ingredient_cost: Decimal | None
     estimated_labor_cost: Decimal | None
     estimated_direct_production_cost: Decimal | None
+    # Phase 9 additive read-side visibility (Spec §12.11): per-Ingredient requirement and
+    # shortage, and the Orders feeding this requirement.
+    has_shortage: bool = False
+    ingredient_needs: list[RequirementIngredientNeedResponse] = []
+    affected_orders: list[RequirementAffectedOrderResponse] = []

@@ -96,6 +96,8 @@ export function IngredientListPage() {
               <TableHead>Family</TableHead>
               <TableHead>Canonical unit</TableHead>
               <TableHead>Physical quantity</TableHead>
+              <TableHead>Reserved</TableHead>
+              <TableHead>Available</TableHead>
               <TableHead>Status</TableHead>
             </TableRow>
           </TableHeader>
@@ -119,6 +121,18 @@ export function IngredientListPage() {
                       {formatDecimal(ingredient.physical_quantity)}
                     </span>
                     {isNegative && <Badge variant="destructive">Needs reconciliation</Badge>}
+                  </TableCell>
+                  <TableCell>{formatDecimal(ingredient.reserved_quantity)}</TableCell>
+                  <TableCell>
+                    <span
+                      className={
+                        Number(ingredient.available_quantity) < 0
+                          ? "font-medium text-destructive"
+                          : undefined
+                      }
+                    >
+                      {formatDecimal(ingredient.available_quantity)}
+                    </span>
                   </TableCell>
                   <TableCell>
                     <Badge variant={ingredient.is_active ? "default" : "secondary"}>

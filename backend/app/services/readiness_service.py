@@ -18,6 +18,7 @@ callers compose it into their own transaction, exactly like
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -153,3 +154,44 @@ def evaluate_and_apply_readiness(db: Session, business: Business, order: Order) 
         )
 
     return order
+
+
+@dataclass(frozen=True)
+class UnsatisfiedLine:
+    line_id: uuid.UUID
+    display_name: str
+    reason: str
+    """`PRODUCTION_PENDING` (a produced line not yet covered by completed production /
+    eligible Surplus), `PURCHASED_STOCK_SHORT` (the Product's aggregate Purchased
+    shortage is non-zero), `MANUAL_CONFIRMATION_REQUIRED` (a Custom Item awaiting the
+    seller), or `PRODUCT_UNAVAILABLE` (the line's Product row cannot be resolved)."""
+
+
+def unsatisfied_lines(db: Session, business: Business, order: Order) -> list[UnsatisfiedLine]:
+    """Phase 9 read-only explanation of *why* an Order is not READY: the lines
+    `is_order_fully_satisfied` would find unsatisfied. Satisfaction itself is decided by
+    the existing `_line_is_satisfied` (never re-implemented here); this only classifies
+    the reason from the line/Product type. Takes no locks and writes nothing — safe for
+    the Dashboard's lock-free read path."""
+    result: list[UnsatisfiedLine] = []
+    for line in order.lines:
+        if _line_is_satisfied(db, business, line):
+            continue
+        if line.line_type == OrderLineType.CUSTOM_ITEM:
+            reason = "MANUAL_CONFIRMATION_REQUIRED"
+        else:
+            product = db.scalar(
+                select(Product).where(
+                    Product.id == line.product_id, Product.business_id == business.id
+                )
+            )
+            if product is None:
+                reason = "PRODUCT_UNAVAILABLE"
+            elif product.product_type == ProductType.PRODUCED:
+                reason = "PRODUCTION_PENDING"
+            else:
+                reason = "PURCHASED_STOCK_SHORT"
+        result.append(
+            UnsatisfiedLine(line_id=line.id, display_name=line.display_name_snapshot, reason=reason)
+        )
+    return result

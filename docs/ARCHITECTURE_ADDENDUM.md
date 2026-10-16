@@ -1429,7 +1429,9 @@ manual satisfaction and Purchased readiness integration), and the concurrency, t
 numeric protections those workflows require, per ADR-132 through ADR-143 above. Phase 8's parent
 baseline is the frozen Phase 7 commit `67ac77444c13196764057784b93f94ef445c0c1c`.
 
-Final verified state: backend full suite **781 passing**, with the Phase 8 concurrency suites (**34**
+Final verified state: backend full suite **783 passing** (the final frozen Phase 8 baseline, which
+includes the subsequent test-only inventory-concurrency CI remediation — no production behavior changed
+in that follow-up), with the Phase 8 concurrency suites (**34**
 real-connection tests) passing; frontend **232/232**; `ruff check` and `ruff format --check` clean;
 `alembic check` reports no schema drift; TypeScript clean; ESLint reports zero errors (9 pre-existing
 warnings); the frontend production build succeeds. Automated end-to-end acceptance —
@@ -1450,3 +1452,118 @@ Surplus; historical `PURCHASED_GOOD` fulfillment cost; historical `SURPLUS` fulf
 the Shopping List UI; the Dashboard; and Analytics.
 
 No Phase 8 commit SHA is recorded here; the repository's Git history is authoritative for it.
+
+### ADR-144 — Phase 9 Read-Side Contract: Reports, No Locks, No Writes, Injected Clock, No Snapshot Guarantee
+
+The Shopping List and Dashboard are typed *report* resources, not paged collections, so ADR-101's
+`PageResponse` applies to resource lists only. Both are strictly read-only: no `FOR UPDATE`, no
+domain writes, no persisted alert/dismissal/acknowledgment state (DASH-005), and no entry into the
+ADR-106/124/141 lock hierarchy. The clock (`now_utc`, `business_today`) is injected so
+Business-timezone boundaries are deterministically testable. The Dashboard issues chunked,
+tenant-scoped, lock-free read queries; shared pure calculators (the same ADR-130 formula and the
+same risk/timing classifiers) give semantic/formula consistency across sections. The total number of
+SQL queries is not a fixed constant — it grows with the number of chunks read from any paginated
+reader — but each query is bounded and tenant-scoped.
+
+Where the Dashboard consumes an existing paginated reader it exhausts it in chunks, so the result
+set has no fixed-size ceiling. This depends on the Phase 8 requirement reader
+(`list_production_requirements_for_business`) having a deterministic total order, `(demand_date, id)`, so OFFSET paging can neither repeat nor omit requirements that share a demand date. After each
+full read the distinct count is compared with the reader's reported total; a mismatch can arise only
+from a concurrent commit between queries, so the read is repeated a bounded number of times (the
+retry count is bounded, not the result). A paginated read that is still inconsistent after those
+retries is rejected with a retryable `409 DASHBOARD_READ_INCONSISTENT` rather than returned as if it
+were complete.
+
+Queries run under the default READ COMMITTED isolation. There is **no request-level snapshot
+guarantee**: a concurrent commit between queries may cause momentary cross-section skew, which the
+next refetch resolves. No partially committed Phase 8 workflow state is exposed, because those
+workflows write transactionally. REPEATABLE READ was evaluated and deliberately not introduced.
+
+### ADR-145 — Shopping List Report Semantics
+
+The ADR-130 cumulative formula is implemented once as pure calculators in
+`app/domain/shopping_list.py` (ADR-109) and shared by the Shopping List, the Dashboard shortage
+alert and the Production Plan/Ingredient figures (Spec §20.13). Presets are 3|7 (default
+`Business.shopping_horizon_days`; display dates today…today+N); a custom range requires
+`start >= business_today`, `end >= start`, ≤ 90 inclusive calendar days, otherwise structured `422`.
+Ingredients with reservations only beyond the range are omitted; shortage-first ordering is shortage
+desc then name. Drilldown shows requirement-level reserved quantity and each contributing Order's
+product-unit demand; no per-Order ingredient apportionment is invented (§17.15). Incomplete-recipe
+demand is a notice, never guessed; Purchased shortages stay out of the list (ADR-130) and surface as
+Dashboard alerts.
+
+### ADR-146 — Dashboard Definitions and Alert Catalog
+
+Alert wording states only what the data proves: ORDER_LOST_READY says only that a previously Ready
+order is no longer Ready (no reason is asserted), and PRODUCTION_START_OVERDUE covers both trigger
+paths (suggested start passed, or demand date passed with no suggested start available). Six
+sections in DASH-001 order; empty sections hidden. Alerts are aggregated one per kind with count,
+capped item list, condition, impact and destination, ordered WARNING then NOTICE then fixed
+priority. Fulfillment risk: `CONFIRMED` (not Ready) with a valid known time and `now >= deadline −
+fulfillment_warning_minutes` (inclusive; already-passed-today stays at risk). Date-only Orders never
+receive an invented deadline and become overdue only after their Business-local date passes
+(CONFIRMED and READY). Production timing: `DUE_TODAY`, `ADVANCE_PREP` (suggested start today for
+later fulfillment), `START_OVERDUE` (suggested start — or, absent one, the demand date — passed with
+no run), else not shown. Expiring Surplus: reusable lot, available > 0, usable-through today…today+2
+(code constant, not a setting). Upcoming = the seven Business-local dates after today. Today's
+Snapshot is operational only; money is labelled scheduled order value, never revenue; no Analytics
+metric appears. A DST-invalid wall-clock time yields no deadline rather than a guess.
+
+### ADR-147 — Cross-Screen Derived Availability
+
+Ingredient Reserved/Available and Surplus Allocated/Available are derived on read from one reader of
+the reservation/allocation projections (`availability_service`) and a pure calculator
+(`calculate_available`, ADR-109); Available may be negative and is never clamped. The Production
+Plan exposes per-requirement `ingredient_needs` (shortage as of the requirement's demand date — the
+ADR-130 figure, not a share attributable to that requirement alone) and `affected_orders`. No Phase
+5–8 inventory, reservation, recalculation, allocation, readiness, lifecycle or locking semantics
+changed.
+
+### ADR-148 — Frontend Freshness Without Touching Mutation Sites
+
+Dashboard and Shopping List queries use `staleTime: 0`, `refetchOnMount: "always"` and refetch on
+window focus, since every relevant write occurs on another page (AC-DASH-005, AC-PLAN-010). The
+Dashboard validates the payload shape and shows an error rather than crashing on a malformed
+response; the page title always renders.
+
+## Phase 9 Completion Status
+
+Phase 9 (Shopping List and Dashboard) is implemented, per ADR-144 through ADR-148 above. Its frozen
+predecessor/base is the Phase 8 commit `6109b1dd09489c0a042f7d020aac34ca3167f5a7`.
+
+**Scope delivered:** the Shopping List (3-day and 7-day presets, an approved custom range —
+`start >= business_today`, `end >= start`, at most 90 inclusive calendar days, otherwise a structured
+`422` — shortage-first ordering, and a contributing-demand drilldown to requirements and Orders); the
+Dashboard's six sections (Attention Required, Active Production, Today's Production, Today's
+Fulfillments, Today's Snapshot, Upcoming) with the approved alert catalog and fulfillment-risk,
+production-timing, and expiring-Surplus semantics (ADR-146); Ingredient Reserved/Available; Surplus
+Allocated/Available; and Production Plan shortage/affected-demand visibility, all read through one shared
+derivation (ADR-147).
+
+**Contracts and guarantees:** the Phase 9 paths are strictly read-side — no domain writes, no workflow
+row locks, no persisted alert state (ADR-144). Reads run under READ COMMITTED with no request-level
+snapshot guarantee; momentary cross-section skew is possible and resolved by the next refetch. Dashboard
+paging is deterministic (the Phase 8 requirement reader orders by `(demand_date, id)`) with no fixed
+result-size ceiling, and a persistently inconsistent paginated read is rejected with a retryable
+`409 DASHBOARD_READ_INCONSISTENT`. Tenant isolation, zero-write, and no-lock behavior are verified by
+dedicated tests (including byte-identical tenant responses before/after another tenant's data is added,
+whole-row table fingerprints unchanged across reads, and reads completing while another connection holds
+`FOR UPDATE` locks on workflow rows).
+
+**Verified state:** backend full suite **920 passed**; frontend Vitest **258 passed**; TypeScript clean;
+ESLint reports zero errors (8 pre-existing warnings); the frontend production build succeeds; `ruff check`
+and `ruff format --check` clean; `alembic check` reports no schema drift. Phase 9 Playwright acceptance
+(`frontend/e2e/phase9/`, run via `frontend/playwright.phase9.config.ts`; the default configuration ignores
+it): three consecutive full-suite runs each passed 3/3, and a reversed-order run (T93, T92, T91) passed with
+every test passing; no test tenants were left behind. No migration was introduced. No dependency was added,
+removed, or changed.
+
+**Not included in Phase 9** (deferred): `READY → COMPLETED`; physical Purchased Product fulfillment;
+physical consumption of allocated Surplus at fulfillment; historical `PURCHASED_GOOD`, `SURPLUS`,
+`PACKAGING`, and `CUSTOM_DIRECT` fulfillment allocations; completed-order Revenue, Direct Cost,
+Contribution, and AOV analytics (Phase 10); and the Settings UI (Phase 11). The separate Order
+Completion / Fulfillment slice remains the next required business-functionality slice, before Phase 10
+Analytics.
+
+No Phase 9 commit SHA is recorded here; the repository's Git history is authoritative for it. Phase 9 is
+not formally frozen by this entry — the freeze follows exact staging, commit, push, and green CI.

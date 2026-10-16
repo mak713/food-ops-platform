@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Annotated
 from zoneinfo import ZoneInfo
 
@@ -19,9 +20,10 @@ from app.core.tenant import get_owned_or_404
 from app.db.models.business import Business
 from app.db.models.surplus import SurplusInventory, SurplusTransaction
 from app.db.session import get_db
+from app.domain.inventory_availability import calculate_available
 from app.schemas.common import PageResponse
 from app.schemas.surplus import SurplusAdjustmentRequest, SurplusManualCreateRequest
-from app.services import surplus_service
+from app.services import availability_service, surplus_service
 
 router = APIRouter()
 
@@ -30,7 +32,12 @@ def _business_today(business: Business) -> date:
     return datetime.now(UTC).astimezone(ZoneInfo(business.timezone)).date()
 
 
-def _to_response(lot: SurplusInventory) -> dict:
+def _to_response(lot: SurplusInventory, *, allocated: Decimal) -> dict:
+    """Phase 9: adds the derived `allocated_quantity` / `available_quantity` (Spec §7.3,
+    SUR-003: physical, allocated, and available stay distinct). `allocated_quantity` is
+    the sum of active `SurplusAllocation` rows (current promises, not consumption);
+    `available_quantity = physical - allocated`. Eligibility (reusable, not past its
+    usable-through date) is a separate, orthogonal question."""
     return {
         "id": str(lot.id),
         "product_id": str(lot.product_id),
@@ -39,6 +46,8 @@ def _to_response(lot: SurplusInventory) -> dict:
             str(lot.source_production_run_id) if lot.source_production_run_id else None
         ),
         "physical_quantity": lot.physical_quantity,
+        "allocated_quantity": allocated,
+        "available_quantity": calculate_available(lot.physical_quantity, allocated),
         "unit_cost_basis": lot.unit_cost_basis,
         "source_total_cost_basis": lot.source_total_cost_basis,
         "produced_at": lot.produced_at,
@@ -47,6 +56,10 @@ def _to_response(lot: SurplusInventory) -> dict:
         "notes": lot.notes,
         "version": lot.version,
     }
+
+
+def _allocated_for(db: Session, business: Business, lot: SurplusInventory) -> Decimal:
+    return availability_service.surplus_allocated_quantities(db, business, [lot.id])[lot.id]
 
 
 def _transaction_to_response(txn: SurplusTransaction) -> dict:
@@ -72,7 +85,7 @@ def create_surplus(
     lot = surplus_service.create_surplus_manual(
         db, business, payload, business_today=_business_today(business)
     )
-    return _to_response(lot)
+    return _to_response(lot, allocated=_allocated_for(db, business, lot))
 
 
 @router.get("")
@@ -85,8 +98,14 @@ def list_surplus(
     items, total = surplus_service.list_surplus_for_business(
         db, business, limit=limit, offset=offset
     )
+    allocated = availability_service.surplus_allocated_quantities(
+        db, business, [i.id for i in items]
+    )
     return PageResponse(
-        items=[_to_response(i) for i in items], total=total, limit=limit, offset=offset
+        items=[_to_response(i, allocated=allocated[i.id]) for i in items],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -97,7 +116,7 @@ def get_surplus(
     db: Annotated[Session, Depends(get_db)],
 ) -> dict:
     lot = get_owned_or_404(db, SurplusInventory, surplus_id, business)
-    return _to_response(lot)
+    return _to_response(lot, allocated=_allocated_for(db, business, lot))
 
 
 @router.post("/{surplus_id}/adjust", dependencies=[Depends(require_csrf)])
@@ -110,7 +129,7 @@ def adjust_surplus(
     lot = surplus_service.adjust_surplus(
         db, business, surplus_id, payload, business_today=_business_today(business)
     )
-    return _to_response(lot)
+    return _to_response(lot, allocated=_allocated_for(db, business, lot))
 
 
 @router.get("/{surplus_id}/transactions")

@@ -18,6 +18,9 @@ export interface Ingredient {
   is_active: boolean;
   version: number;
   physical_quantity: string;
+  // Phase 9 (Spec §7.3, INV-004/005): derived by the backend — never stored, never editable.
+  reserved_quantity: string;
+  available_quantity: string;
   weighted_average_unit_cost: string;
   latest_purchase_unit_cost: string | null;
   replacement_unit_cost: string | null;
@@ -34,6 +37,8 @@ export interface IngredientSummary {
   is_active: boolean;
   version: number;
   physical_quantity: string;
+  reserved_quantity: string;
+  available_quantity: string;
 }
 
 export interface IngredientCreateRequest {

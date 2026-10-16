@@ -1000,7 +1000,10 @@ def list_production_requirements_for_business(
         db.scalars(
             select(ProductionRequirement)
             .where(*conditions)
-            .order_by(ProductionRequirement.demand_date.asc())
+            .order_by(
+                ProductionRequirement.demand_date.asc(),
+                ProductionRequirement.id.asc(),
+            )
             .limit(limit)
             .offset(offset)
         )

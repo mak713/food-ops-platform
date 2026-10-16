@@ -86,6 +86,11 @@ class IngredientResponse(BaseModel):
     is_active: bool
     version: int
     physical_quantity: Decimal
+    reserved_quantity: Decimal
+    """Derived (Spec §7.3): `SUM(active ingredient reservations)` — never stored, never
+    editable (INV-005)."""
+    available_quantity: Decimal
+    """Derived: `physical_quantity - reserved_quantity`; may be negative."""
     weighted_average_unit_cost: Decimal
     latest_purchase_unit_cost: Decimal | None
     replacement_unit_cost: Decimal | None
@@ -102,3 +107,5 @@ class IngredientSummary(BaseModel):
     is_active: bool
     version: int
     physical_quantity: Decimal
+    reserved_quantity: Decimal
+    available_quantity: Decimal

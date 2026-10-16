@@ -7,6 +7,27 @@ import type { PageResponse } from "../customers/api";
 export type ProductionRunStatus = "IN_PRODUCTION" | "COMPLETED" | "CANCELED";
 export type CostBasisSource = "WAC" | "FALLBACK";
 
+// Phase 9 additive read-side visibility (Spec §12.11): per-Ingredient need and shortage (the
+// same ADR-130 derivation the Shopping List uses) and the Orders feeding a requirement.
+export interface RequirementIngredientNeed {
+  ingredient_id: string;
+  ingredient_name: string;
+  canonical_unit: string;
+  required_quantity: string;
+  physical_quantity: string;
+  shortage_quantity: string;
+}
+
+export interface RequirementAffectedOrder {
+  order_id: string;
+  order_number: string;
+  status: string;
+  customer_name: string | null;
+  fulfillment_date: string | null;
+  fulfillment_time: string | null;
+  demand_quantity: string;
+}
+
 export interface ProductionRequirement {
   id: string;
   product_id: string;
@@ -26,6 +47,9 @@ export interface ProductionRequirement {
   estimated_ingredient_cost: string | null;
   estimated_labor_cost: string | null;
   estimated_direct_production_cost: string | null;
+  has_shortage: boolean;
+  ingredient_needs: RequirementIngredientNeed[];
+  affected_orders: RequirementAffectedOrder[];
 }
 
 export interface ProductionRunIngredient {

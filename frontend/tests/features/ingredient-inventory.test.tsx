@@ -73,6 +73,8 @@ const FLOUR_BASE = {
   is_active: true,
   version: 1,
   physical_quantity: "0.000000",
+  reserved_quantity: "0.000000",
+  available_quantity: "0.000000",
   weighted_average_unit_cost: "0.000000",
   latest_purchase_unit_cost: null,
   replacement_unit_cost: null,
@@ -86,6 +88,8 @@ describe("Ingredient detail — inventory display", () => {
     const NEGATIVE_FLOUR = {
       ...FLOUR_BASE,
       physical_quantity: "-15.000000",
+      reserved_quantity: "5.000000",
+      available_quantity: "-20.000000",
       weighted_average_unit_cost: "2.500000",
       latest_purchase_unit_cost: "3.000000",
       effective_replacement_cost: "3.000000",
@@ -122,7 +126,7 @@ describe("Ingredient detail — inventory display", () => {
   });
 
   it("offers Restock but not Initial Balance once inventory has values", async () => {
-    const INITIALIZED = { ...FLOUR_BASE, physical_quantity: "10.000000", weighted_average_unit_cost: "1.000000" };
+    const INITIALIZED = { ...FLOUR_BASE, physical_quantity: "10.000000", available_quantity: "10.000000", weighted_average_unit_cost: "1.000000" };
     vi.stubGlobal(
       "fetch",
       fetchRouterFor([
@@ -151,7 +155,7 @@ describe("Ingredient Initial Balance", () => {
           pattern: /\/api\/v1\/ingredients\/i1\/inventory\/initial-balance$/,
           respond: (_url, init) => {
             capturedBody = JSON.parse(init!.body as string);
-            return jsonResponse(201, { ...FLOUR_BASE, physical_quantity: "5000.000000", version: 2 });
+            return jsonResponse(201, { ...FLOUR_BASE, physical_quantity: "5000.000000", available_quantity: "5000.000000", version: 2 });
           },
         },
       ]),
@@ -214,7 +218,7 @@ describe("Ingredient Restock", () => {
 
   it("submits a same-family unit restock with the current version", async () => {
     let capturedBody: Record<string, unknown> | undefined;
-    const INITIALIZED = { ...FLOUR_BASE, physical_quantity: "10.000000", weighted_average_unit_cost: "1.000000", version: 2 };
+    const INITIALIZED = { ...FLOUR_BASE, physical_quantity: "10.000000", available_quantity: "10.000000", weighted_average_unit_cost: "1.000000", version: 2 };
     vi.stubGlobal(
       "fetch",
       fetchRouterFor([
@@ -224,7 +228,7 @@ describe("Ingredient Restock", () => {
           pattern: /\/api\/v1\/ingredients\/i1\/inventory\/restock$/,
           respond: (_url, init) => {
             capturedBody = JSON.parse(init!.body as string);
-            return jsonResponse(200, { ...INITIALIZED, physical_quantity: "15.000000", version: 3 });
+            return jsonResponse(200, { ...INITIALIZED, physical_quantity: "15.000000", available_quantity: "15.000000", version: 3 });
           },
         },
       ]),
@@ -532,7 +536,7 @@ describe("Ingredient Manual Adjustment", () => {
           pattern: /\/api\/v1\/ingredients\/i1\/inventory\/adjustments$/,
           respond: (_url, init) => {
             capturedBody = JSON.parse(init!.body as string);
-            return jsonResponse(200, { ...FLOUR_BASE, physical_quantity: "-5.000000", version: 2 });
+            return jsonResponse(200, { ...FLOUR_BASE, physical_quantity: "-5.000000", available_quantity: "-5.000000", version: 2 });
           },
         },
       ]),

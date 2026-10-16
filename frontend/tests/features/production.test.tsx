@@ -80,6 +80,9 @@ const REQUIREMENT = {
   estimated_ingredient_cost: "10.00",
   estimated_labor_cost: "15.00",
   estimated_direct_production_cost: "25.00",
+  has_shortage: false,
+  ingredient_needs: [],
+  affected_orders: [],
 };
 
 const RUN_INGREDIENT = {

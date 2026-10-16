@@ -8,6 +8,7 @@ individually (never router-wide), matching the established Customer/Product patt
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
@@ -17,6 +18,7 @@ from app.api.deps import get_current_business, require_csrf
 from app.db.models.business import Business
 from app.db.models.ingredient import Ingredient
 from app.db.session import get_db
+from app.domain.inventory_availability import calculate_available
 from app.schemas.common import PageResponse
 from app.schemas.ingredient import (
     IngredientCreateRequest,
@@ -25,15 +27,22 @@ from app.schemas.ingredient import (
     IngredientUpdateRequest,
     LifecycleActionRequest,
 )
-from app.services import ingredient_inventory_service, ingredient_service
+from app.services import availability_service, ingredient_inventory_service, ingredient_service
 
 router = APIRouter()
 
 
-def ingredient_to_response(ingredient: Ingredient) -> IngredientResponse:
+def ingredient_to_response(
+    ingredient: Ingredient, *, db: Session, business: Business
+) -> IngredientResponse:
     """Shared response mapper — also reused by `app.api.v1.ingredient_inventory`, since
     every inventory mutation returns the same `IngredientResponse` shape the plain CRUD
-    routes do (Phase 5 Plan §C)."""
+    routes do (Phase 5 Plan §C). Phase 9 adds the derived `reserved_quantity` /
+    `available_quantity` (Spec §7.3, INV-004/005): read from the reservation projection
+    through the one shared reader, never stored and never client-editable."""
+    reserved = availability_service.ingredient_reserved_quantities(db, business, [ingredient.id])[
+        ingredient.id
+    ]
     return IngredientResponse(
         id=str(ingredient.id),
         name=ingredient.name,
@@ -42,6 +51,8 @@ def ingredient_to_response(ingredient: Ingredient) -> IngredientResponse:
         is_active=ingredient.is_active,
         version=ingredient.version,
         physical_quantity=ingredient.physical_quantity,
+        reserved_quantity=reserved,
+        available_quantity=calculate_available(ingredient.physical_quantity, reserved),
         weighted_average_unit_cost=ingredient.weighted_average_unit_cost,
         latest_purchase_unit_cost=ingredient.latest_purchase_unit_cost,
         replacement_unit_cost=ingredient.replacement_unit_cost,
@@ -51,7 +62,7 @@ def ingredient_to_response(ingredient: Ingredient) -> IngredientResponse:
     )
 
 
-def _to_summary(ingredient: Ingredient) -> IngredientSummary:
+def _to_summary(ingredient: Ingredient, reserved: Decimal) -> IngredientSummary:
     return IngredientSummary(
         id=str(ingredient.id),
         name=ingredient.name,
@@ -60,6 +71,8 @@ def _to_summary(ingredient: Ingredient) -> IngredientSummary:
         is_active=ingredient.is_active,
         version=ingredient.version,
         physical_quantity=ingredient.physical_quantity,
+        reserved_quantity=reserved,
+        available_quantity=calculate_available(ingredient.physical_quantity, reserved),
     )
 
 
@@ -75,8 +88,14 @@ def list_ingredients(
     items, total = ingredient_service.list_ingredients_for_business(
         db, business, q=q, is_active=is_active, limit=limit, offset=offset
     )
+    reserved = availability_service.ingredient_reserved_quantities(
+        db, business, [i.id for i in items]
+    )
     return PageResponse(
-        items=[_to_summary(i) for i in items], total=total, limit=limit, offset=offset
+        items=[_to_summary(i, reserved[i.id]) for i in items],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -87,7 +106,7 @@ def create_ingredient(
     db: Annotated[Session, Depends(get_db)],
 ) -> IngredientResponse:
     ingredient = ingredient_service.create_ingredient(db, business, payload)
-    return ingredient_to_response(ingredient)
+    return ingredient_to_response(ingredient, db=db, business=business)
 
 
 @router.get("/{ingredient_id}")
@@ -97,7 +116,7 @@ def get_ingredient(
     db: Annotated[Session, Depends(get_db)],
 ) -> IngredientResponse:
     ingredient = ingredient_service.get_ingredient_for_business(db, ingredient_id, business)
-    return ingredient_to_response(ingredient)
+    return ingredient_to_response(ingredient, db=db, business=business)
 
 
 @router.patch("/{ingredient_id}", dependencies=[Depends(require_csrf)])
@@ -108,7 +127,7 @@ def update_ingredient(
     db: Annotated[Session, Depends(get_db)],
 ) -> IngredientResponse:
     ingredient = ingredient_service.update_ingredient(db, business, ingredient_id, payload)
-    return ingredient_to_response(ingredient)
+    return ingredient_to_response(ingredient, db=db, business=business)
 
 
 @router.post("/{ingredient_id}/archive", dependencies=[Depends(require_csrf)])
@@ -119,7 +138,7 @@ def archive_ingredient(
     db: Annotated[Session, Depends(get_db)],
 ) -> IngredientResponse:
     ingredient = ingredient_service.archive_ingredient(db, business, ingredient_id, payload.version)
-    return ingredient_to_response(ingredient)
+    return ingredient_to_response(ingredient, db=db, business=business)
 
 
 @router.post("/{ingredient_id}/reactivate", dependencies=[Depends(require_csrf)])
@@ -132,7 +151,7 @@ def reactivate_ingredient(
     ingredient = ingredient_service.reactivate_ingredient(
         db, business, ingredient_id, payload.version
     )
-    return ingredient_to_response(ingredient)
+    return ingredient_to_response(ingredient, db=db, business=business)
 
 
 @router.delete("/{ingredient_id}", status_code=204, dependencies=[Depends(require_csrf)])

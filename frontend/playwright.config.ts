@@ -6,8 +6,9 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "./e2e",
   // The Phase 8 acceptance suite is a local regression harness (Docker PostgreSQL,
-  // dev stack, test-tenant lifecycle); run it explicitly via playwright.phase8.config.ts.
-  testIgnore: "**/phase8/**",
+  // dev stack, test-tenant lifecycle); run it explicitly via playwright.phase8.config.ts
+  // (Phase 9 likewise: playwright.phase9.config.ts).
+  testIgnore: ["**/phase8/**", "**/phase9/**"],
   fullyParallel: true,
   webServer: {
     command: "npm run dev",

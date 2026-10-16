@@ -88,6 +88,8 @@ const RUN_SOURCED_LOT = {
   product_name: "Sourdough Loaf",
   source_production_run_id: "run1",
   physical_quantity: "6.000000",
+  allocated_quantity: "4.000000",
+  available_quantity: "2.000000",
   unit_cost_basis: "1.250000",
   source_total_cost_basis: "7.50",
   produced_at: "2026-02-01T12:00:00Z",
