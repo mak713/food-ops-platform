@@ -236,6 +236,15 @@ class OrderCancelRequest(BaseModel):
     acknowledged_warning_fingerprint: str | None = None
 
 
+class OrderCompleteRequest(BaseModel):
+    """Order Completion (`READY -> COMPLETED`). Only the Order's expected `version` is
+    carried: no acknowledgment fingerprint exists because a Complete request that is
+    no longer valid is rejected outright (zero mutation), never completed on the strength
+    of a stale acknowledgment."""
+
+    version: int
+
+
 class OrderLineManualFulfillmentRequest(BaseModel):
     """Phase 8 (Independent Implementation Review Remediation Plan v1/v1.2, Finding
     4) — the seller-controlled action that sets a one-off `CUSTOM_ITEM` line's
@@ -405,6 +414,24 @@ class ConfirmationIssueResponse(BaseModel):
     field: str | None = None
 
 
+class HistoricalCostAllocationResponse(BaseModel):
+    id: str
+    cost_type: str
+    order_line_id: str | None
+    amount: Decimal
+
+
+class HistoricalCostResponse(BaseModel):
+    """Operational historical direct cost for ONE Order, derived exclusively from its
+    immutable `OrderCostAllocation` rows (ADR-057) — not Analytics, not accounting. Every
+    cost category is always present (an explicit `0.00` is a known-zero fact, distinct from
+    a category that does not apply)."""
+
+    total: Decimal
+    by_type: dict[str, Decimal]
+    allocations: list[HistoricalCostAllocationResponse]
+
+
 class OrderResponse(BaseModel):
     id: str
     order_number: str
@@ -446,6 +473,11 @@ class OrderResponse(BaseModel):
     # that has a recorded READY entry in its OrderStatusHistory, distinguishing
     # "was Ready, now demoted" from "never yet satisfied" for UI attention.
     was_ever_ready: bool = False
+    # Order Completion: when the Order was completed (UTC instant; period membership is
+    # interpreted in the Business timezone by consumers). NULL until COMPLETED.
+    completed_at: datetime | None = None
+    # Order Completion: present only for a COMPLETED Order.
+    historical_cost: HistoricalCostResponse | None = None
 
 
 class OrderSummary(BaseModel):

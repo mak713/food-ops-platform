@@ -942,6 +942,12 @@ def _cancel_confirmed_order_attempt(
     }
     candidate_ids = _discover_full_order_set(db, business, order_id, preflight_products)
     locked_orders = _lock_orders_sorted(db, business, candidate_ids)
+    # `SELECT ... FOR UPDATE` does not refresh an instance the session already holds, and the
+    # non-locking preflight above loaded this Order BEFORE the lock was granted. If another
+    # transaction (e.g. Order Completion) committed a change to it while this request waited,
+    # the in-memory version/status would be stale and would pass the checks below. Expire the
+    # identity map so every read from here on reflects the locked, committed state.
+    db.expire_all()
     order = locked_orders.get(order_id)
     if order is None:
         raise NotFoundError()

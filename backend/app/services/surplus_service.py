@@ -31,9 +31,15 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from app.core.api_errors import ApiError
-from app.core.tenant import check_version, commit_or_raise_stale, get_owned_or_404
+from app.core.tenant import (
+    check_version,
+    commit_or_raise_stale,
+    get_owned_or_404,
+    stale_version_error,
+)
 from app.db.enums import OrderStatus, ProductType, SurplusTransactionType
 from app.db.models.business import Business
 from app.db.models.order import Order
@@ -303,6 +309,11 @@ def adjust_surplus(
         except _CandidateOrderSetGrew:
             db.rollback()
             continue
+        except StaleDataError:
+            # An explicit flush inside the reconciliation path lost a version race: the same
+            # lost update `commit_or_raise_stale` reports at commit time, reported identically.
+            db.rollback()
+            raise stale_version_error(resource="surplus_inventory") from None
     raise ApiError(
         409,
         "SURPLUS_ADJUSTMENT_CONTENTION",
@@ -346,6 +357,25 @@ def _adjust_surplus_attempt(
     product, locked_orders, locked_lots = _lock_full_graph_for_surplus_mutation(
         db, business, lot.product_id
     )
+
+    # The version check and quantity above ran on the lot as loaded BEFORE the Order/Product/
+    # lot locks were granted; `FOR UPDATE` does not refresh an instance the session already
+    # holds, and another transaction (e.g. Order Completion consuming this lot) may have
+    # committed in between. Refresh under the full lock graph, re-check the expected version,
+    # and recompute/re-validate before the floor / slack / acknowledgment logic reads either.
+    try:
+        db.refresh(lot)
+        check_version(lot, payload.version, resource="surplus_inventory")
+        new_physical_quantity = lot.physical_quantity + payload.quantity_delta
+        if new_physical_quantity < 0:
+            raise ApiError(
+                422,
+                "SURPLUS_ADJUSTMENT_INSUFFICIENT_BALANCE",
+                "This adjustment would make the Surplus balance negative, which is not permitted.",
+            )
+    except ApiError:
+        db.rollback()
+        raise
 
     # Active-run hard floor (§3) — checked under the now-complete lock, before any
     # mutation, before the acknowledgment machinery is even entered. Distinct from

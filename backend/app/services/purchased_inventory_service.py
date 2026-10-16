@@ -24,9 +24,10 @@ from psycopg.errors import UniqueViolation
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from app.core.api_errors import ApiError
-from app.core.tenant import check_version, commit_or_raise_stale
+from app.core.tenant import check_version, commit_or_raise_stale, stale_version_error
 from app.db.enums import ProductType, PurchasedInventoryTransactionType
 from app.db.models.business import Business
 from app.db.models.order import Order
@@ -318,9 +319,21 @@ def _restock_purchased_product_attempt(
         check_version(existing, payload.version, resource="purchased_product_inventory")
 
         locked_orders = _lock_candidate_orders_and_product(db, business, product_id)
+
+        # The version check above ran on the row as loaded BEFORE the Order/Product locks
+        # were granted; `FOR UPDATE` does not refresh an instance the session already holds.
+        # Refresh under the locks and re-check the version before computing the weighted
+        # average, physical quantity and transaction from it.
+        try:
+            db.refresh(existing)
+            check_version(existing, payload.version, resource="purchased_product_inventory")
+        except ApiError:
+            db.rollback()
+            raise
+
         inventory = _apply_restock_to_existing_row(db, business, existing, payload)
         if locked_orders:
-            db.flush()  # the mutation must be visible before readiness reevaluation
+            _flush_or_raise_stale(db)  # the mutation must be visible before readiness reevaluation
             for order in locked_orders.values():
                 readiness_service.evaluate_and_apply_readiness(db, business, order)
         commit_or_raise_stale(db, resource="purchased_product_inventory")
@@ -476,18 +489,22 @@ def _adjust_purchased_product_attempt(
             "This product's inventory has not been initialized yet.",
         )
     check_version(inventory, payload.version, resource="purchased_product_inventory")
-
-    new_quantity = inventory.physical_quantity + payload.quantity_change
-    _require_representable(new_quantity, field="physical quantity")
-    if new_quantity < 0:
-        raise ApiError(
-            422,
-            "PURCHASED_INVENTORY_INSUFFICIENT_BALANCE",
-            "This adjustment would make the purchased inventory balance negative, which "
-            "is not permitted.",
-        )
+    _validated_adjusted_quantity(inventory, payload)
 
     locked_orders = _lock_candidate_orders_and_product(db, business, product_id)
+
+    # The checks above ran on the row as loaded BEFORE the Order/Product locks were granted;
+    # `FOR UPDATE` does not refresh an instance the session already holds. Another transaction
+    # (e.g. Order Completion deducting this Product) may have committed in between. Refresh
+    # under the locks, re-check the expected version, and recompute/re-validate from the
+    # refreshed physical quantity before any write.
+    try:
+        db.refresh(inventory)
+        check_version(inventory, payload.version, resource="purchased_product_inventory")
+        new_quantity = _validated_adjusted_quantity(inventory, payload)
+    except ApiError:
+        db.rollback()
+        raise
 
     inventory.physical_quantity = new_quantity
     db.add(
@@ -502,11 +519,37 @@ def _adjust_purchased_product_attempt(
         )
     )
     if locked_orders:
-        db.flush()  # the mutation must be visible before readiness reevaluation
+        _flush_or_raise_stale(db)  # the mutation must be visible before readiness reevaluation
         for order in locked_orders.values():
             readiness_service.evaluate_and_apply_readiness(db, business, order)
     commit_or_raise_stale(db, resource="purchased_product_inventory")
     return inventory
+
+
+def _validated_adjusted_quantity(
+    inventory: PurchasedProductInventory, payload: PurchasedAdjustmentRequest
+) -> Decimal:
+    new_quantity = inventory.physical_quantity + payload.quantity_change
+    _require_representable(new_quantity, field="physical quantity")
+    if new_quantity < 0:
+        raise ApiError(
+            422,
+            "PURCHASED_INVENTORY_INSUFFICIENT_BALANCE",
+            "This adjustment would make the purchased inventory balance negative, which "
+            "is not permitted.",
+        )
+    return new_quantity
+
+
+def _flush_or_raise_stale(db: Session) -> None:
+    """Explicit-flush counterpart of `commit_or_raise_stale`: a `StaleDataError` raised by an
+    explicit flush (before the readiness reevaluation) is the same lost-update race and is
+    reported as the same structured `409 STALE_VERSION`, never as a raw ORM exception."""
+    try:
+        db.flush()
+    except StaleDataError:
+        db.rollback()
+        raise stale_version_error(resource="purchased_product_inventory") from None
 
 
 def set_replacement_cost(

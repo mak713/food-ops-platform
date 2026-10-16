@@ -29,10 +29,13 @@ from app.schemas.common import PageResponse
 from app.schemas.order import (
     ConfirmationIssueResponse,
     CustomItemWorkloadPreviewItem,
+    HistoricalCostAllocationResponse,
+    HistoricalCostResponse,
     IngredientAvailabilityPreviewItem,
     OperationalPreviewResponse,
     OperationalWarningResponse,
     OrderCancelRequest,
+    OrderCompleteRequest,
     OrderConfirmedEditRequest,
     OrderConfirmRequest,
     OrderCreateRequest,
@@ -46,6 +49,7 @@ from app.schemas.order import (
     PurchasedShortagePreviewItem,
 )
 from app.services import (
+    order_completion_service,
     order_lifecycle_service,
     order_preview_service,
     order_service,
@@ -84,6 +88,27 @@ def _payment_to_response(payment: Payment) -> PaymentResponse:
         payment_method=payment.payment_method,
         payment_date=payment.payment_date,
         notes=payment.notes,
+    )
+
+
+def _historical_cost_response(
+    order: Order, *, db: Session, business: Business
+) -> HistoricalCostResponse | None:
+    if order.status is not OrderStatus.COMPLETED:
+        return None
+    cost = order_completion_service.get_historical_cost(db, business, order)
+    return HistoricalCostResponse(
+        total=cost.total,
+        by_type={cost_type.value: amount for cost_type, amount in cost.by_type.items()},
+        allocations=[
+            HistoricalCostAllocationResponse(
+                id=str(a.id),
+                cost_type=a.cost_type.value,
+                order_line_id=str(a.order_line_id) if a.order_line_id else None,
+                amount=a.amount,
+            )
+            for a in cost.allocations
+        ],
     )
 
 
@@ -158,6 +183,8 @@ def _to_response(order: Order, *, db: Session, business: Business) -> OrderRespo
         production_locked=production_locked,
         ready_at=order.ready_at,
         was_ever_ready=was_ever_ready,
+        completed_at=order.completed_at,
+        historical_cost=_historical_cost_response(order, db=db, business=business),
     )
 
 
@@ -435,6 +462,23 @@ def cancel_order(
         expected_version=payload.version,
         business_today=_business_today(business),
         acknowledged_warning_fingerprint=payload.acknowledged_warning_fingerprint,
+    )
+    return _to_response(order, db=db, business=business)
+
+
+@router.post("/{order_id}/complete", dependencies=[Depends(require_csrf)])
+def complete_order(
+    order_id: uuid.UUID,
+    payload: OrderCompleteRequest,
+    business: Annotated[Business, Depends(get_current_business)],
+    db: Annotated[Session, Depends(get_db)],
+) -> OrderResponse:
+    order = order_completion_service.complete_order(
+        db,
+        business,
+        order_id,
+        expected_version=payload.version,
+        business_today=_business_today(business),
     )
     return _to_response(order, db=db, business=business)
 

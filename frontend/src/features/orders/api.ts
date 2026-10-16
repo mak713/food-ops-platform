@@ -81,6 +81,31 @@ export interface Order {
   // Phase 8: true only while CONFIRMED and previously Ready — surfaces a demotion
   // notice distinct from an order that was never yet fully covered.
   was_ever_ready: boolean;
+  // Order Completion: when the order was completed (UTC instant). NULL until COMPLETED.
+  completed_at: string | null;
+  // Order Completion: operational historical direct cost for this one order, derived by the
+  // backend exclusively from its immutable cost-allocation rows. Present only when COMPLETED.
+  historical_cost: HistoricalCost | null;
+}
+
+export type HistoricalCostType =
+  "PRODUCTION" | "SURPLUS" | "PURCHASED_GOOD" | "PACKAGING" | "CUSTOM_DIRECT";
+
+export interface HistoricalCostAllocation {
+  id: string;
+  cost_type: HistoricalCostType;
+  order_line_id: string | null;
+  amount: string;
+}
+
+export interface HistoricalCost {
+  total: string;
+  by_type: Record<HistoricalCostType, string>;
+  allocations: HistoricalCostAllocation[];
+}
+
+export interface OrderCompleteRequest {
+  version: number;
 }
 
 export interface OrderSummary {
@@ -294,6 +319,8 @@ export const ordersApi = {
     post<Order>(`/api/v1/orders/${id}/confirm`, payload),
   cancel: (id: string, payload: OrderCancelRequest) =>
     post<Order>(`/api/v1/orders/${id}/cancel`, payload),
+  complete: (id: string, payload: OrderCompleteRequest) =>
+    post<Order>(`/api/v1/orders/${id}/complete`, payload),
   setLineManualFulfillment: (
     id: string,
     lineId: string,

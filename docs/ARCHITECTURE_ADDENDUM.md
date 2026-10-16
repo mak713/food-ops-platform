@@ -1565,5 +1565,185 @@ Contribution, and AOV analytics (Phase 10); and the Settings UI (Phase 11). The 
 Completion / Fulfillment slice remains the next required business-functionality slice, before Phase 10
 Analytics.
 
-No Phase 9 commit SHA is recorded here; the repository's Git history is authoritative for it. Phase 9 is
-not formally frozen by this entry — the freeze follows exact staging, commit, push, and green CI.
+Phase 9 was formally frozen at commit `8c211a2ab7c1acc25e770c8365d117c5758fed7f` after its exact-SHA
+CI run succeeded. (This paragraph corrects the original entry, which was written before that push and
+freeze and stated that Phase 9 was not yet formally frozen.) The repository's Git history remains
+authoritative for the commit itself.
+
+## Order Completion / Fulfillment Architecture Decisions
+
+The Order Completion / Fulfillment slice implements `READY → COMPLETED` (Spec §4.2, §7.15/7.16, §11.8;
+AC-COMP-001..005, AC-PUR-005, AC-SUR-009), which the phase plan never scheduled and Phases 8 and 9 each
+deferred. It is a distinct, explicitly authorized slice between Phase 9 and Phase 10 Analytics. These
+decisions record the independently reviewed implementation and its concurrency remediation.
+
+### ADR-149 — Order Completion Is One Atomic, Lock-Composed Transaction
+
+`POST /api/v1/orders/{id}/complete` takes the body `{version}`. Only a `READY` Order may complete.
+Payment status and fulfillment date/time are **not** preconditions (ADR-034): an unpaid or
+not-yet-due Order completes, and payments may still be recorded afterwards. Completion physically
+fulfills the Order and freezes its historical cost in **one** transaction; nothing is partially
+committed.
+
+The transaction composes the existing hierarchy of ADR-124/141 exactly, adding no lock edge: globally
+sorted candidate Orders → Products → Recipe/Ingredient (sorted union) → Surplus lots / Purchased
+inventory, using discover–lock–verify with a bounded retry (3) that ends in `409
+ORDER_LOCK_DISCOVERY_CONTENTION`. Completion **never** locks `ProductionRun` rows. Finish and Cancel of
+a run lock the run row first; because Completion does not take that lock there is no reverse cycle.
+
+Start Production locks the Product and requirement but not the Order, so an Order can become
+production-locked after Completion's Order locks are held. An early active-run check is therefore
+advisory and a fast rejection only. Active-run protection (`409 ORDER_PRODUCTION_LOCKED`, ADR-126) is
+**re-checked authoritatively after Product serialization is held**; a run created in that gap is
+detected and Completion rejects with zero mutation.
+
+Coverage is revalidated under all locks using the frozen readiness derivation plus physical
+sufficiency. A READY Order that is no longer fully covered is rejected with `409 ORDER_COVERAGE_LOST`;
+a failed Complete commits **no demotion** and zero domain mutation (the rejection rolls back; the Order
+remains READY until the ordinary readiness machinery acts). A non-READY Order is `409
+ORDER_NOT_COMPLETABLE`; a stale version is `409 STALE_VERSION`.
+
+`SELECT … FOR UPDATE` does not refresh an instance the session already holds, and the preflight loads
+the Order before the lock is granted. After the Order locks, and again after the complete lock graph is
+held, the session is expired so that every authoritative version/status/line/fact check reads
+post-lock committed state (see ADR-153). A `StaleDataError` inside the attempt is reported as the
+structured `STALE_VERSION`. Rows written by Completion's own historical-cost ledger that already exist
+for the Order when Completion starts are an **invariant violation** (`500
+ORDER_COMPLETION_INVARIANT_VIOLATED`), never something to repair or overwrite; the same code guards the
+post-condition assertions run before commit.
+
+### ADR-150 — Completion Historical-Cost Ledger Semantics
+
+Completion writes `OrderCostAllocation` rows of types `PURCHASED_GOOD`, `SURPLUS`, `PACKAGING` and
+`CUSTOM_DIRECT`. It never creates, rewrites or deletes a `PRODUCTION` row (ADR-136, ADR-143). A known
+zero is distinct from an absent row throughout.
+
+**Purchased.** The fulfilled quantity comes from the authoritative line demand/reservation. The unit
+cost is the inventory's weighted-average cost (WAC) read under the locked authoritative state. Latest
+Purchase cost, the Replacement Cost override and the current Product cost never participate. The
+transaction `total_cost` uses the existing 6-decimal storage quantization; the ledger amount is that
+persisted total converted **once** to cents (`ROUND_HALF_UP`, ADR-115). A zero WAC writes an explicit
+`0.00` historical row.
+
+**Surplus.** One historical source allocation is written per consumed active Surplus allocation. The
+lot's stored `unit_cost_basis` is authoritative; the amount is allocation quantity × stored basis,
+converted once to cents. There is **no** residual reconciliation against the lot's
+`source_total_cost_basis`, so sub-cent drift between a lot's consumptions and its recorded total basis
+is accepted. A zero basis writes an explicit `0.00` row.
+
+**Packaging.** Uses `packaging_cost_total_snapshot` only, as one immutable row per Order Line,
+including `0.00`; it is never recomputed from current catalog configuration.
+
+**Custom Direct.** Uses `custom_direct_cost_estimate` only. A non-null zero writes `0.00`; `NULL` writes
+**no** row. No actual-cost-entry workflow is invented.
+
+Every Completion historical-cost row is immutable once written, subject to the existing
+source-exclusivity `CHECK`.
+
+### ADR-151 — Physical Fulfillment of Purchased and Surplus Stock
+
+**Purchased.** An Order may carry several lines for one Purchased Product, so sufficiency and deduction
+are **aggregated by Product** against the locked inventory; physical inventory can never become
+negative. Each line still receives its own `ORDER_FULFILLMENT` transaction and its own source-linked
+`PURCHASED_GOOD` ledger row. Fulfillment does not change WAC. After the status change the Product
+recalculation runs, which releases the completed Order's operational Purchased reservation state.
+
+**Surplus.** Completion consumes exactly the completing Order's active Surplus allocation rows. Each
+corresponding lot's physical quantity is reduced; one `ORDER_FULFILLMENT` Surplus transaction and one
+`SURPLUS` ledger allocation are written per lot × line allocation; and the consumed operational
+allocation rows are deleted. Sibling Orders' allocations remain operationally intact, reconciled
+through the frozen closure machinery. Before commit the transaction asserts `Σ active allocations <=
+physical` for every touched lot. A lot's usable-through eligibility is **not** re-judged at Completion
+once a valid allocation exists.
+
+### ADR-152 — Completion Read Model and UI
+
+`OrderResponse.completed_at` is nullable and is populated for Completed Orders. A Completed Order also
+exposes a read-only per-Order `historical_cost` (per-category amounts including explicit zeros, the
+total, and the allocations) derived **only** from its immutable `OrderCostAllocation` rows. This is
+Order-level operational historical truth, not Phase 10 Analytics; `Order.estimated_*` stays unused and
+`NULL`.
+
+The Complete Order action is exposed only for `READY` Orders and sits behind a confirmation dialog. No
+acknowledgment-fingerprint protocol exists for Complete: an invalid or stale Completion is rejected by
+the server rather than acknowledged. Structured rejections (`STALE_VERSION`, `ORDER_COVERAGE_LOST`,
+`ORDER_PRODUCTION_LOCKED`, and the rest) are surfaced to the user, and a synchronous re-entrancy guard
+prevents a double submit. A successful Completion invalidates the operational queries it affects
+(Order, Dashboard, Shopping List, Production Plan/requirements, Surplus and purchased inventory). No
+Revenue, Contribution, AOV, period analytics, charts or CSV functionality is introduced here.
+
+### ADR-153 — Post-Lock Freshness for Workflows That Read Before Locking
+
+When a mutation (1) loads or version-checks a mutable target **before** acquiring the shared lock
+graph, and (2) may wait on that graph while another transaction changes the target, the pre-lock ORM
+instance is **not authoritative** after lock acquisition: `SELECT … FOR UPDATE` does not overwrite an
+already-loaded instance, and a later flush would raise SQLAlchemy `StaleDataError` as a raw exception.
+Once shared serialization is held, the workflow must:
+
+- expire or refresh the relevant target;
+- re-check the caller's expected version (structured `409 STALE_VERSION`);
+- recompute every value derived from the refreshed row;
+- repeat the applicable validation before any mutation;
+- roll back, and translate an explicit-flush `StaleDataError` into the standard structured `409
+  STALE_VERSION`.
+
+A raw ORM stale-write exception must never be an observable concurrency outcome. Current applications:
+
+- **Order Cancel** expires the identity map after the complete sorted Order-lock phase and before any
+  check.
+- **Purchased Adjustment** refreshes, re-checks the version and recomputes/re-validates the new
+  quantity after Order/Product serialization, and maps an explicit-flush `StaleDataError`.
+- **Existing-row Purchased Restock** (`version` supplied) refreshes and re-checks the version before
+  the WAC and quantity calculations, and maps an explicit-flush `StaleDataError`; the first-ever
+  (`version = null`) path is unchanged.
+- **Surplus Adjustment** refreshes, re-checks and recomputes/re-validates after the full
+  Order/Product/Recipe/Ingredient/Surplus graph, before the hard-floor, slack and acknowledgment logic;
+  a flush-time `StaleDataError` is mapped in the retry wrapper.
+
+Custom Item manual fulfillment already satisfies the invariant by construction: its first
+authoritative Order read is the locked, tenant-scoped lookup, so it loads nothing before the lock; no
+remediation was required. Order Completion itself follows the rule (ADR-149). This ADR changes no
+business semantics, lock order, endpoint contract or schema.
+
+## Order Completion / Fulfillment Completion Status
+
+Order Completion / Fulfillment is implemented, per ADR-149 through ADR-153 above. Its frozen
+predecessor/base is the Phase 9 commit `8c211a2ab7c1acc25e770c8365d117c5758fed7f`.
+
+**Scope delivered:** `READY → COMPLETED`; physical Purchased Product fulfillment; physical consumption
+of allocated Surplus; immutable `PURCHASED_GOOD`, `SURPLUS`, `PACKAGING` and `CUSTOM_DIRECT` historical
+cost (ADR-150); Completed Order timestamp and status history; the Order-level historical-cost read
+model; the Complete Order frontend action; and the concurrency hardening Completion required
+(ADR-153, applied to Order Cancel, Purchased Adjustment, existing-row Purchased Restock and Surplus
+Adjustment).
+
+**Verified state (accepted at independent review):**
+
+- backend full suite **998 passed**;
+- frontend Vitest **267 passed**, from the independently approved pre-remediation frontend state (the
+  concurrency remediation changed no frontend file or response shape);
+- TypeScript clean; ESLint zero errors (8 pre-existing warnings); the production build succeeds;
+- `ruff check` and `ruff format --check` clean; `alembic check` reports no schema drift;
+- Order Completion Playwright acceptance (`frontend/e2e/completion/`, run via
+  `frontend/playwright.completion.config.ts`; the default configuration ignores it): **4/4** on three
+  consecutive full runs, and a reversed-order run (T104 → T103 → T102 → T101) with every test passing;
+- Phase 9 Playwright regression **3/3** and Phase 8 Playwright regression **18/18**;
+- deterministic stale-identity focused suite (`test_order_completion_stale_identity.py`): **6 passed**
+  (regenerated at closeout; four of its tests fail with a raw `StaleDataError` against the
+  pre-remediation services);
+- strict Completion concurrency + stale-identity files: **28/28** on ten consecutive runs;
+- relevant frozen Phase 5/7/8 backend suites (Purchased, Surplus, Order lifecycle, concurrency): **150
+  passed**;
+- zero leaked test tenants;
+- no migration was introduced and no dependency was added, removed or changed.
+
+**Not included in this slice** (deferred): Phase 10 Analytics — Revenue, Direct Cost period
+aggregation, Contribution, Contribution Margin, the Completed Orders KPI, AOV, product/customer/Order
+analytics, comparison periods and CSV export; reversals, un-completing and historical corrections; a
+Completion preview; post-completion notes-editing work not otherwise already supported; refunds; the
+Settings UI; and seed/demo expansion. Phase 10 Analytics is the next planned major phase once this
+Completion slice is formally frozen.
+
+No Order Completion commit SHA is recorded here because none exists yet. This slice is **not formally
+frozen by this entry**; the freeze follows closeout review, exact staging, staged-diff review, commit,
+push, and exact-SHA green CI.

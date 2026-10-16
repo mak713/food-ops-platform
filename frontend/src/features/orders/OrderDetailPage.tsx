@@ -19,6 +19,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
+import { useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { z } from "zod";
 import { ApiError } from "../../api/client";
@@ -27,6 +28,8 @@ import { ErrorBanner } from "../../components/shared/ErrorBanner";
 import { FormField } from "../../components/shared/FormField";
 import { StaleVersionPanel } from "../../components/shared/StaleVersionPanel";
 import { formatQuantityForDisplay } from "../../lib/decimal";
+import { formatInstantInTimezone, formatMoney } from "../../lib/format";
+import { useAuth } from "../auth/AuthContext";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -49,7 +52,7 @@ import {
   TableHeader,
   TableRow,
 } from "../../components/ui/table";
-import { ordersApi } from "./api";
+import { ordersApi, type HistoricalCostType } from "./api";
 
 const paymentSchema = z.object({
   amount: z.string().min(1, "Amount is required"),
@@ -58,6 +61,14 @@ const paymentSchema = z.object({
   notes: z.string().optional(),
 });
 type PaymentFormValues = z.infer<typeof paymentSchema>;
+
+const COST_TYPE_LABEL: Record<HistoricalCostType, string> = {
+  PRODUCTION: "Production (recorded when production finished)",
+  SURPLUS: "Surplus used",
+  PURCHASED_GOOD: "Purchased goods",
+  PACKAGING: "Packaging",
+  CUSTOM_DIRECT: "Custom item direct cost",
+};
 
 const PAYMENT_STATUS_LABEL: Record<string, string> = {
   UNPAID: "Unpaid",
@@ -107,6 +118,29 @@ export function OrderDetailPage() {
       }),
     onSuccess: invalidate,
   });
+  const { me } = useAuth();
+  const [completeOpen, setCompleteOpen] = useState(false);
+  // Synchronous re-entrancy guard: `isPending` only updates after React re-renders, so a
+  // rapid double activation could otherwise fire two requests. (The server independently
+  // rejects a duplicate Complete — this just avoids sending it.)
+  const completeInFlight = useRef(false);
+  const completeMutation = useMutation({
+    mutationFn: () => ordersApi.complete(id as string, { version: query.data!.version }),
+    onSuccess: async () => {
+      setCompleteOpen(false);
+      await Promise.all([
+        invalidate(),
+        // Completion consumes Purchased stock and Surplus and removes the order from the
+        // operational views — refresh everything that derives from them.
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+        queryClient.invalidateQueries({ queryKey: ["shopping-list"] }),
+        queryClient.invalidateQueries({ queryKey: ["production-requirements"] }),
+        queryClient.invalidateQueries({ queryKey: ["surplus"] }),
+        queryClient.invalidateQueries({ queryKey: ["purchased-inventory"] }),
+      ]);
+    },
+    onError: () => setCompleteOpen(false),
+  });
   const manualFulfillmentMutation = useMutation({
     mutationFn: ({ lineId, satisfied }: { lineId: string; satisfied: boolean }) =>
       ordersApi.setLineManualFulfillment(id as string, lineId, {
@@ -129,7 +163,8 @@ export function OrderDetailPage() {
       : undefined;
   const cancellationAfterProductionIssue =
     cancelMutation.error instanceof ApiError &&
-    cancelMutation.error.body?.error.code === "CANCELLATION_AFTER_PRODUCTION_REQUIRES_ACKNOWLEDGMENT"
+    cancelMutation.error.body?.error.code ===
+      "CANCELLATION_AFTER_PRODUCTION_REQUIRES_ACKNOWLEDGMENT"
       ? cancelMutation.error.body.error.issues[0]
       : undefined;
   const cancelGenericError =
@@ -137,6 +172,20 @@ export function OrderDetailPage() {
       ? cancelMutation.error instanceof ApiError
         ? cancelMutation.error.body?.error.message
         : "Something went wrong canceling the order. Please try again."
+      : undefined;
+
+  const completeError = completeMutation.error;
+  const completeIsStale =
+    completeError instanceof ApiError && completeError.body?.error.code === "STALE_VERSION";
+  const completeCoverageIssues =
+    completeError instanceof ApiError && completeError.body?.error.code === "ORDER_COVERAGE_LOST"
+      ? completeError.body.error.issues
+      : undefined;
+  const completeGenericError =
+    completeMutation.isError && !completeIsStale && !completeCoverageIssues
+      ? completeError instanceof ApiError
+        ? completeError.body?.error.message
+        : "Something went wrong completing the order. Please try again."
       : undefined;
 
   const handleConfirmAnyway = () => {
@@ -322,7 +371,9 @@ export function OrderDetailPage() {
                             : "No manual fulfillment"}
                         </Badge>
                         {line.manual_fulfillment_required && (
-                          <Badge variant={line.manual_fulfillment_satisfied ? "default" : "outline"}>
+                          <Badge
+                            variant={line.manual_fulfillment_satisfied ? "default" : "outline"}
+                          >
                             {line.manual_fulfillment_satisfied ? "Satisfied" : "Not satisfied"}
                           </Badge>
                         )}
@@ -525,7 +576,9 @@ export function OrderDetailPage() {
 
         {(order.status === "CONFIRMED" || order.status === "READY") && (
           <section className="rounded-md border border-dashed p-3 text-sm">
-            <h2 className="mb-1 font-semibold">{order.status === "READY" ? "Ready" : "Confirmed"}</h2>
+            <h2 className="mb-1 font-semibold">
+              {order.status === "READY" ? "Ready" : "Confirmed"}
+            </h2>
             {order.status === "READY" && order.ready_at && (
               <p className="mb-2 text-green-700">
                 ✓ Fully covered — ready since {new Date(order.ready_at).toLocaleString()}.
@@ -541,9 +594,9 @@ export function OrderDetailPage() {
               <p className="mb-2 text-amber-700">
                 Some of this order's demand is covered by an active production run. It cannot be
                 canceled until that run completes or is canceled, and its operational fields
-                (quantity, product, date, time) are read-only here for the same reason — pricing
-                and notes can still be edited. The server independently re-checks this for every
-                change, regardless of what this notice reports.
+                (quantity, product, date, time) are read-only here for the same reason — pricing and
+                notes can still be edited. The server independently re-checks this for every change,
+                regardless of what this notice reports.
               </p>
             ) : null}
 
@@ -552,8 +605,73 @@ export function OrderDetailPage() {
                 {cancelGenericError}
               </p>
             )}
+            {completeGenericError && (
+              <p role="alert" className="mb-2 text-sm text-destructive">
+                {completeGenericError}
+              </p>
+            )}
+            {completeCoverageIssues && (
+              <div role="alert" className="mb-2 text-sm text-destructive">
+                <p className="font-medium">
+                  This order is no longer fully covered, so it was not completed. Nothing was
+                  changed.
+                </p>
+                <ul className="list-disc pl-5">
+                  {completeCoverageIssues.map((issue, index) => (
+                    <li key={`${issue.code}-${index}`}>{issue.message}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {completeIsStale && (
+              <StaleVersionPanel
+                onRefresh={async () => {
+                  completeMutation.reset();
+                  await query.refetch();
+                }}
+              />
+            )}
 
             <div className="flex items-center gap-2">
+              {order.status === "READY" && (
+                <AlertDialog open={completeOpen} onOpenChange={setCompleteOpen}>
+                  <AlertDialogTrigger
+                    className={buttonVariants({ variant: "default", size: "sm" })}
+                    disabled={order.production_locked || completeMutation.isPending}
+                  >
+                    Complete Order
+                  </AlertDialogTrigger>
+                  <AlertDialogContent>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>Complete this order?</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        Completing records that this order was fulfilled to the customer. It deducts
+                        any purchased stock and uses up the surplus allocated to it, and permanently
+                        records its direct costs. This cannot be undone.
+                        {order.payment_status !== "PAID" &&
+                          ` Payment is not required: ${formatMoney(order.payments_total)} of ${formatMoney(order.final_total)} is recorded, and you can keep recording payments afterward.`}
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>Not yet</AlertDialogCancel>
+                      <AlertDialogAction
+                        disabled={completeMutation.isPending}
+                        onClick={() => {
+                          if (completeInFlight.current) return;
+                          completeInFlight.current = true;
+                          completeMutation.mutate(undefined, {
+                            onSettled: () => {
+                              completeInFlight.current = false;
+                            },
+                          });
+                        }}
+                      >
+                        {completeMutation.isPending ? "Completing…" : "Complete order"}
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
+              )}
               {order.status === "CONFIRMED" && (
                 <Link
                   to={`/app/orders/${order.id}/edit`}
@@ -579,7 +697,9 @@ export function OrderDetailPage() {
                   {cancellationAfterProductionIssue ? (
                     <>
                       <AlertDialogHeader>
-                        <AlertDialogTitle>This order has completed production history</AlertDialogTitle>
+                        <AlertDialogTitle>
+                          This order has completed production history
+                        </AlertDialogTitle>
                         <AlertDialogDescription>
                           {cancellationAfterProductionIssue.message} Canceling will not restore
                           consumed ingredients or reverse the recorded production cost — that
@@ -626,6 +746,49 @@ export function OrderDetailPage() {
                 </AlertDialogContent>
               </AlertDialog>
             </div>
+          </section>
+        )}
+
+        {order.status === "COMPLETED" && (
+          <section
+            className="rounded-md border border-dashed p-3 text-sm"
+            data-testid="completed-panel"
+          >
+            <h2 className="mb-1 font-semibold">Completed</h2>
+            {order.completed_at && (
+              <p className="mb-2">
+                Fulfilled and completed{" "}
+                {formatInstantInTimezone(order.completed_at, me?.business.timezone ?? "UTC")}. You
+                can still record payments.
+              </p>
+            )}
+            {order.historical_cost && (
+              <div
+                className="rounded-md border border-amber-500/50 bg-amber-500/10 p-3"
+                data-testid="historical-cost"
+              >
+                <h3 className="mb-1 font-semibold">
+                  Historical direct cost (internal — not shown to the customer)
+                </h3>
+                <p className="mb-2 text-xs text-muted-foreground">
+                  Operational direct cost recorded when this order was completed. It is fixed
+                  history: later price, recipe, or cost changes do not alter it, and it is not
+                  accounting profit.
+                </p>
+                <dl className="flex flex-col gap-1">
+                  {(Object.keys(COST_TYPE_LABEL) as HistoricalCostType[]).map((type) => (
+                    <div key={type} className="flex justify-between">
+                      <dt className="text-muted-foreground">{COST_TYPE_LABEL[type]}</dt>
+                      <dd>{formatMoney(order.historical_cost!.by_type[type] ?? "0.00")}</dd>
+                    </div>
+                  ))}
+                  <div className="mt-1 flex justify-between border-t pt-1 font-semibold">
+                    <dt>Total historical direct cost</dt>
+                    <dd>{formatMoney(order.historical_cost.total)}</dd>
+                  </div>
+                </dl>
+              </div>
+            )}
           </section>
         )}
 
