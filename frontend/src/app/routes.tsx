@@ -4,6 +4,7 @@ import { Link, Navigate, Outlet, useNavigate } from "react-router-dom";
 import { Button } from "../components/ui/button";
 import { authApi } from "../features/auth/api";
 import { useAuth } from "../features/auth/AuthContext";
+import { AnalyticsPage } from "../features/analytics/AnalyticsPage";
 import { AccountSettingsPage } from "../features/auth/AccountSettingsPage";
 import { LoginPage } from "../features/auth/LoginPage";
 import { PasswordResetConfirmPage } from "../features/auth/PasswordResetConfirmPage";
@@ -55,7 +56,7 @@ import { SurplusListPage } from "../features/surplus/SurplusListPage";
 // session (GET /api/v1/auth/me) — never from anything client-stored. Every other module
 // under §12.2 (Orders, Production, Customers, ...) is added when the phase that owns it
 // begins. Phase 9 replaces the Dashboard placeholder with the real Dashboard and adds the
-// Shopping List under Production.
+// Shopping List under Production. Phase 10 adds Analytics.
 
 function AppLayout() {
   const { me, clearMe } = useAuth();
@@ -71,8 +72,8 @@ function AppLayout() {
 
   return (
     <div className="flex min-h-svh flex-col">
-      <header className="flex items-center justify-between border-b border-border p-4">
-        <div className="flex items-center gap-4 text-sm">
+      <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-border p-4">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
           <span className="font-semibold">{me?.business.name}</span>
           <Link to="/app/dashboard" className="text-muted-foreground hover:text-foreground">
             Dashboard
@@ -100,6 +101,9 @@ function AppLayout() {
           </Link>
           <Link to="/app/surplus" className="text-muted-foreground hover:text-foreground">
             Surplus
+          </Link>
+          <Link to="/app/analytics" className="text-muted-foreground hover:text-foreground">
+            Analytics
           </Link>
           <Link to="/app/account" className="text-muted-foreground hover:text-foreground">
             Account
@@ -140,6 +144,7 @@ export const routes: RouteObject[] = [
         children: [
           { index: true, element: <Navigate to="/app/dashboard" replace /> },
           { path: "dashboard", element: <DashboardPage /> },
+          { path: "analytics", element: <AnalyticsPage /> },
           { path: "account", element: <AccountSettingsPage /> },
           { path: "customers", element: <CustomerListPage /> },
           { path: "customers/new", element: <CustomerFormPage /> },

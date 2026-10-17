@@ -6,6 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api.v1.account import router as account_router
+from app.api.v1.analytics import router as analytics_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.customers import router as customers_router
 from app.api.v1.dashboard import router as dashboard_router
@@ -66,6 +67,7 @@ app.include_router(
 app.include_router(surplus_router, prefix="/api/v1/surplus", tags=["surplus"])
 app.include_router(dashboard_router, prefix="/api/v1/dashboard", tags=["dashboard"])
 app.include_router(shopping_list_router, prefix="/api/v1/shopping-list", tags=["shopping-list"])
+app.include_router(analytics_router, prefix="/api/v1/analytics", tags=["analytics"])
 
 
 @app.get("/health")

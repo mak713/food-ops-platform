@@ -1710,6 +1710,12 @@ business semantics, lock order, endpoint contract or schema.
 Order Completion / Fulfillment is implemented, per ADR-149 through ADR-153 above. Its frozen
 predecessor/base is the Phase 9 commit `8c211a2ab7c1acc25e770c8365d117c5758fed7f`.
 
+Order Completion / Fulfillment was formally frozen at commit `48be1388f654bd8c7520ace69ae21628b4ffaa6f`
+(subject: "Order completion and fulfillment") after its exact-SHA CI run `38890851463` completed
+successfully. (This paragraph corrects the original entry, which was written before that commit, push and
+freeze and stated that no Completion commit existed and that the slice was not yet formally frozen. The
+repository's Git history remains authoritative for the commit itself.)
+
 **Scope delivered:** `READY → COMPLETED`; physical Purchased Product fulfillment; physical consumption
 of allocated Surplus; immutable `PURCHASED_GOOD`, `SURPLUS`, `PACKAGING` and `CUSTOM_DIRECT` historical
 cost (ADR-150); Completed Order timestamp and status history; the Order-level historical-cost read
@@ -1741,9 +1747,233 @@ Adjustment).
 aggregation, Contribution, Contribution Margin, the Completed Orders KPI, AOV, product/customer/Order
 analytics, comparison periods and CSV export; reversals, un-completing and historical corrections; a
 Completion preview; post-completion notes-editing work not otherwise already supported; refunds; the
-Settings UI; and seed/demo expansion. Phase 10 Analytics is the next planned major phase once this
-Completion slice is formally frozen.
+Settings UI; and seed/demo expansion. Phase 10 Analytics was the next planned major phase after this
+slice; it has since been implemented (see the Phase 10 sections below).
 
-No Order Completion commit SHA is recorded here because none exists yet. This slice is **not formally
-frozen by this entry**; the freeze follows closeout review, exact staging, staged-diff review, commit,
-push, and exact-SHA green CI.
+## Phase 10 Architecture Decisions
+
+Phase 10 implements the Spec's descriptive historical Analytics (§6.14 ANA-001..012, §11.11, §12.16, §13,
+§19.12–19.13, §21.16 AC-ANA-001..010). It is strictly read-side: no schema change, no persisted reporting
+state, no domain writes and no locks. It reads only facts frozen by Phases 6–8 and the Order Completion /
+Fulfillment slice (ADR-136, ADR-143, ADR-149, ADR-150) and changes none of them. Its frozen predecessor/base is
+the Order Completion / Fulfillment commit `48be1388f654bd8c7520ace69ae21628b4ffaa6f`.
+
+### ADR-154 — Analytics Reporting Periods: Business-Local Calendar Days, One Shared UTC Boundary Function
+
+An Analytics period is a run of Business-local calendar days, displayed inclusively to the seller
+(`[start_date, end_date]`) and queried as the half-open UTC interval `[lower_bound, upper_bound)`, where
+`lower_bound` is the UTC instant at which `start_date` begins and `upper_bound` the instant at which the day
+after `end_date` begins, both in the Business timezone (ADR-129). Every boundary — period, previous period and
+Trend bucket — comes from one authoritative pure function (`app.domain.analytics_periods`), so adjacent reporting
+periods share exactly one UTC instant: nothing is counted twice and nothing falls through a gap, including across
+DST and unusual midnight transitions (an ambiguous local midnight resolves to its first occurrence; a nonexistent
+local midnight resolves to the transition instant; a wholly skipped civil date is an empty interval whose
+neighbours still partition time). The Business's stored timezone semantics are unchanged, and the request clock is
+an injectable seam (Phase 9 precedent) so periods are deterministic under test.
+
+Last 7/30/90 Days are Business-local today plus the N−1 preceding calendar days (today is partial) — not rolling
+N×24-hour windows. This Month is the first day of the current Business-local month through today. This Year is
+January 1 through Business-local today. A Custom Range uses seller-entered inclusive dates with `start <= end`;
+presets reject supplied custom dates and `CUSTOM` requires both.
+
+The previous comparison period is the immediately preceding equivalent number of Business-local calendar days for
+every range (`previous_end = start − 1 day`, `previous_start = start − N days`), including This Month and This
+Year; the previous calendar month/year, same dates last month, or prior-year year-to-date are never silently
+substituted (e.g. Oct 1–16 compares with Sep 15–30). A previous period that cannot be represented in the supported
+date domain (underflow/overflow) is rejected, never clamped.
+
+A Custom Range may span at most **3,660 inclusive Business-local calendar days**. This is an evidence-driven
+technical resource guard, **not a business policy**: it was introduced only after measurement showed that the
+maximum representable range (year 1 to year 9999) generated roughly 120,000 zero-filled monthly Trend buckets, a
+~19.8 MB response and ~9 s of processing, followed by an impractical chart/table dataset. A 3,661+ day Custom
+Range is rejected with a structured `422 ANALYTICS_RANGE_INVALID` carrying issue `ANALYTICS_RANGE_TOO_LARGE`
+whose details include the requested day count and the maximum (`3660`); it is never clamped or truncated. The
+limit lives in the shared period resolver, so Overview, Trends, Products, Customers, Orders and every CSV accept
+or reject exactly the same ranges. Presets (≤ 366 days) are unaffected, there is no minimum date, and the Phase 9
+Shopping List 90-day cap (ADR-145) is unrelated.
+
+### ADR-155 — Historical KPI Selection and Overview Comparison
+
+Revenue is `SUM(Order.final_total)` for COMPLETED Orders whose `completed_at` falls in the selected Business-local
+period (operational recorded Order revenue — including frozen line subtotals, the signed Order adjustment and
+manual tax — not cash or accounting revenue). Direct Cost is the immutable `OrderCostAllocation.amount` selected
+**through those Orders** — never by the allocation's own `created_at` — and all five historical cost types
+participate: `PRODUCTION`, `SURPLUS`, `PURCHASED_GOOD`, `PACKAGING` and `CUSTOM_DIRECT`. Canceled, Draft, Confirmed
+and Ready Orders never contaminate completed financial KPIs, even when a Canceled Order still owns historical
+PRODUCTION cost (ADR-143); sunk-cost reporting for Canceled Orders is out of scope. Orders without ledger rows
+contribute zero Direct Cost and known-zero rows are valid facts.
+
+Contribution = Revenue − Direct Cost (may be negative). Contribution Margin = Contribution ÷ Revenue, `null` when
+Revenue is zero. Completed Orders = the selected Completed Order count. AOV = Revenue ÷ Completed Orders, `null`
+when the count is zero. Money is quantized to cents and ratios to six decimal places, `ROUND_HALF_UP`, in a pure
+calculator with an isolated Decimal context (ADR-109); PostgreSQL performs all summation. The current and previous
+Overview periods are aggregated coherently in one scan, with ledger rows summed per Order before the one-to-one
+join so ledger fan-out never multiplies Order Revenue.
+
+Previous-period comparison applies only to the Overview KPIs (Revenue, Direct Cost, Contribution, Contribution
+Margin, Completed Orders, AOV). The absolute delta (current − previous) is retained wherever defined. Ordinary
+percentage change, `(current − previous) ÷ previous`, is `null` when the previous value is null, zero **or
+negative** (a percentage relative to a zero or loss-making base is not fabricated; this mainly affects
+Contribution after a loss-making prior period, whose absolute delta is still present). The Contribution Margin
+comparison is a ratio / percentage-point delta, not percentage growth; count deltas stay integers; a previous
+period with no Completed Orders is reported as no prior data rather than as fabricated growth. No previous-period
+Product, Customer or Order tables and no previous-period Trend series exist.
+
+Trend granularity is ≤ 31 days daily, 32–183 days weekly (ISO weeks starting Monday) and > 183 days monthly.
+Buckets are Business-local, clipped to the selected period and zero-filled; their boundaries come from the ADR-154
+function and PostgreSQL assigns Orders to buckets by UTC range against those bounds (no `AT TIME ZONE` grouping),
+so the sum of the buckets equals the Overview values for the additive fields.
+
+### ADR-156 — Product Analytics Attribution, Tenant-Local Resolution and Reconciliation
+
+Product Revenue is the immutable Product-backed `OrderLine.line_subtotal` (`STANDARD_OPTION` and
+`CUSTOM_QUANTITY` lines). Product Direct Cost is the immutable historical cost allocation attributed through
+`order_line_id` (Surplus to the consuming line, not the lot's origin). `STANDARD_OPTION` and `CUSTOM_QUANTITY`
+both preserve underlying Product units; package quantity applies only where a Selling Option/package actually
+exists (`null` for Custom Quantity) and is never conflated with underlying units. A Product's Completed Order
+count is the number of distinct Orders, not the number of lines. "Most profitable" means highest total
+Contribution; "Highest margin" means highest Contribution Margin (among Products with Revenue); both are exposed
+and labeled separately. Order-level adjustment and manual tax are never proportionally apportioned to Products.
+`CUSTOM_ITEM` lines deliberately have no Product and are reported as a separate Custom Items group with no
+fabricated units, packages or Product identity. Cost rows whose line provenance is null — or does not resolve to a
+line of the same Order — are surfaced as `unattributed_direct_cost` rather than silently assigned; ownership is
+never inferred from current mutable relationships.
+
+The reconciliation identities, for the same Completed-Order fact set, are:
+
+`Σ Product Revenue + Custom Item Revenue + Order Adjustment + Manual Tax + Unreconciled Revenue = Overview Revenue`
+
+`Σ Product Direct Cost + Custom Item Direct Cost + Unattributed Direct Cost = Overview Direct Cost`
+
+`order_level.unreconciled_revenue` is the defensive remainder: expected `0.00`, and non-zero only for a quarantined
+reference (below) or an Order whose `final_total` is inconsistent with its components; it is never hidden.
+
+**Tenant-local reference resolution.** A Product-backed historical line contributes to a Product row only if its
+`product_id` resolves to a `Product` owned by the current Business (the join carries its own `business_id`
+predicate). An unresolved or foreign Product reference does not expose its raw UUID; does not create a Product
+row, highlight or CSV row; moves its line Revenue into `order_level.unreconciled_revenue`; and moves its
+line-attributed cost into `order_level.unattributed_direct_cost`. A `STANDARD_OPTION` `selling_option_id` is
+exposed only if the Option resolves tenant-locally and belongs to the same resolved Product; otherwise the lines
+collapse into one safe `(unavailable selling option)` breakdown (kind `STANDARD_OPTION`, no identifier, never
+reinterpreted as Custom Quantity). Current retained Product and Selling Option names are display labels only,
+resolved by separate same-tenant read-only lookups, and never recalculate historical numeric truth: renaming or
+archiving changes a label, never a number.
+
+**Product CSV.** Besides the Product and `SELLING_OPTION` rows, `products.csv` exports explicit reconciliation rows:
+`CUSTOM_ITEMS`, `ORDER_ADJUSTMENT`, `MANUAL_TAX`, `UNRECONCILED_REVENUE`, `UNATTRIBUTED_DIRECT_COST` and `TOTAL`.
+`UNRECONCILED_REVENUE` is always emitted, including at `0.00`, has no Product identity, and derives no Direct Cost
+or Contribution. `SELLING_OPTION` rows are drill-down children of Product rows and are not included again in the
+top-level reconciliation sums.
+
+### ADR-157 — Customer, Order, Cancellation and Outstanding-Balance Semantics
+
+Customer analytics uses COMPLETED Orders only. Guest means strictly `orders.customer_id IS NULL`. A non-null
+`customer_id` is a Customer only if it resolves to a `Customer` owned by the current Business (the join carries
+its own tenant predicate). A non-null reference that fails tenant-local resolution is **neither a Customer nor a
+Guest**: it is excluded from unique/new/returning counts and ranked rows, its foreign UUID is never exposed, the
+Order still contributes to Revenue (the Order itself belongs to the tenant), and Order reporting shows it as
+`customer_id = null` with the safe label `(unavailable customer)` — never `Guest`, including for the Largest
+Completed Order.
+
+A **New** Customer has no Completed Order before the selected period's lower bound; a **Returning** Customer has at
+least one earlier Completed Order. A Customer with several in-period Orders is classified once, and
+Draft/Confirmed/Ready/Canceled Orders never affect classification. Guest activity (Orders, Revenue, AOV, share of
+Completed Orders) is reported separately, is excluded from unique/new/returning counts, and is never a synthetic
+Customer. The Customer table is one sortable, deterministically tie-broken list (Revenue / Completed Orders /
+name); per-customer cost, churn, loyalty and cohorts are not reported.
+
+Canceled Order reporting uses `canceled_at` (converted through the same ADR-154 bounds); Canceled Orders remain
+reportable in counts and Order rows but never enter completed financial metrics, and their rows show no balance,
+cost or contribution. The Largest Completed Order and the fulfillment-method distribution (PICKUP, DELIVERY, OTHER,
+UNSPECIFIED, always present) use Completed Orders only. No `created_at`, fulfillment date or payment date is an
+Analytics period-membership timestamp.
+
+**Outstanding recorded balance — as of now** is operational, not accounting: for Completed Orders whose
+`completed_at` is in the selected period, the balance is `final_total − SUM(Payments)` as of the request, counted
+only where positive. Paid, overpaid, zero-dollar, Draft, Confirmed, Ready and Canceled Orders contribute nothing;
+an Order with no Payments contributes its full total. Payments recorded after Completion (ADR-120, ADR-149) may
+legitimately change this as-of-now balance without rewriting historical Revenue, Direct Cost or Contribution, so it
+is deliberately excluded from historical-immutability assertions. It is not labeled Accounts Receivable.
+
+### ADR-158 — Analytics Read Side, Tenant Isolation and CSV Contract
+
+Extending ADR-144, Analytics is strictly read-only: no `FOR UPDATE`, no domain writes, no persisted reporting cache
+or materialized truth, no new table, column, enum or index. Queries run under the default READ COMMITTED
+isolation, and **no cross-endpoint or whole-request snapshot guarantee is claimed** (REPEATABLE READ and persisted
+snapshots were deliberately not introduced). Each individual report keeps its related numeric facts internally
+coherent through its designed SQL fact set: Overview and Trends in one statement each; Product numeric facts and
+reconciliation in one statement; Customers and Orders via a single-row summary CTE joined to the page. Current
+same-tenant display-label lookups (Product and Selling Option names) are separate read-only reads that never
+contribute to a number. Cross-page skew under a concurrent Completion is possible and resolved by the next read.
+
+The tenant is derived only from the authenticated session; no client `business_id` is accepted. Every independently
+tenant-bearing joined table (Orders, Order Lines, cost allocations, Payments, Customers, Products, Selling Options)
+is constrained by its own `business_id`; relationship references are never trusted as tenant authorization.
+Orderings have deterministic total tie-breaking, JSON tables page with the project's `limit/offset` convention, and
+no result is silently truncated.
+
+**CSV contract.** Four exports exist: Products, Customers, Orders and Trends (no separate Overview CSV). Products
+and Trends serialize the same authoritative report objects and query semantics used for their JSON. Customers and
+Orders use dedicated deterministic, unpaged streaming query paths implementing the same tenant/date/metric
+definitions as their JSON reports; JSON↔CSV semantic and numeric equivalence is enforced by integration tests
+rather than assumed. The Customers CSV derives its Customer rows **and** its Guest/totals sentinel row from one SQL
+statement (a `UNION ALL` ordered by a group key so the Guest row is last, fetched through a server-side cursor),
+so one export cannot mix pre- and post-concurrent-Completion fact sets; a barrier-controlled two-connection test
+covers this. Exports are UTF-8 with a BOM, use RFC-compatible quoting, fixed column order and a descriptive
+`Content-Disposition` filename, and send `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+User-controlled text cells whose first character (after optional spaces) is a spreadsheet formula prefix
+(`= + - @`, TAB, CR) are neutralized with a leading apostrophe; numeric cells — including negative values such as a
+negative Contribution — remain numeric and are never prefixed. Customers and Orders stream with bounded memory;
+Products and Trends are catalog- and bucket-bounded. In the current stack FastAPI's request-scoped database
+dependency remains alive through `StreamingResponse` iteration (teardown runs after the response is sent), and an
+ASGI integration test proves the stream never iterates a closed Session.
+
+## Phase 10 Completion Status
+
+Phase 10 (Analytics) is implemented and has passed independent review, per ADR-154 through ADR-158 above. Its
+frozen predecessor/base is the Order Completion / Fulfillment commit
+`48be1388f654bd8c7520ace69ae21628b4ffaa6f`.
+
+**Scope delivered:** the Business-local Analytics period resolver (Last 7/30/90 Days, This Month, This Year and a
+Custom Range with the 3,660-day technical maximum, with previous equivalent-period Overview comparison); Overview
+Revenue, Direct Cost, Contribution, Contribution Margin, Completed Orders and AOV; Business-local zero-filled
+Trends; Product Analytics with the Selling Option breakdown and Custom Item / reconciliation reporting; Customer
+Analytics with New/Returning classification and separate Guest activity; Order Analytics with Canceled reporting,
+fulfillment-method distribution, the largest Completed Order and the as-of-now outstanding recorded balance;
+Products, Customers, Orders and Trends CSV exports; the Recharts trend visualization with an accessible data table;
+a responsive `/app/analytics` page reachable from primary navigation (the shell header navigation wraps instead of
+overflowing the document at 375 px); and defensive tenant-local reference resolution so an unresolved or foreign
+reference never discloses an identifier.
+
+Phase 10 introduced **no migration, no schema or index change and no persisted Analytics state**. The only
+dependency change is the Spec-locked, approved frontend `recharts` package plus its normal lockfile resolution; no
+backend dependency changed. No frozen Phase 1–Completion behavior was modified.
+
+**Verification state (independently accepted):**
+
+- backend full suite **1214 passed**; frontend Vitest **300 passed**;
+- Phase 10 Playwright acceptance (`frontend/e2e/phase10/`, run via `frontend/playwright.phase10.config.ts`; the
+  default configuration ignores it) **4/4 on three consecutive full runs**, plus a reversed-order run (T114 → T113
+  → T112 → T111) with every test passing;
+- frozen regression Playwright: Phase 9 **3/3**, Order Completion **4/4**, Phase 8 final complete rerun **18/18**
+  (an earlier resource-loaded Phase 8 run showed two unrelated Order Entry preview-timing failures; the untouched
+  tests passed individually and the full idle rerun passed 18/18);
+- `ruff check` and `ruff format --check` clean; `alembic check` reports no drift; TypeScript clean; ESLint reports
+  zero errors (8 pre-existing warnings); the production build succeeds;
+- release-blocking coverage includes historical immutability after later price/cost/recipe/labor/Surplus changes,
+  tenant isolation including foreign-UUID containment (byte-level scans of every JSON and CSV surface), Business-
+  local / DST / ambiguous- and skipped-midnight boundaries, the 3,660-day Custom Range boundary, Product ↔ Overview
+  reconciliation (including the quarantine path), Customer classification, Customers CSV concurrency coherence,
+  CSV JSON-equivalence, injection safety and streaming/session lifetime, read-only / no-lock guarantees, and a
+  375 px document-overflow assertion.
+
+**Not included in Phase 10** (deferred): forecasting or predictive analytics; AI insights; formal accounting; tax
+reporting; cash-flow accounting; Accounts Receivable; inventory valuation reporting beyond frozen Direct Cost;
+loyalty, churn, lifetime value and cohorts; dynamic pricing; capacity optimization; Canceled-order sunk-cost
+analytics; refunds and historical corrections; the Settings UI (Phase 11); seed/demo expansion (Phase 12); and any
+warehouse, OLAP or materialized aggregate infrastructure. **Phase 11 — Settings and Account completion is next only
+after Phase 10 is formally frozen.**
+
+Phase 10 is implemented and independently reviewed but is **not formally frozen by this entry**, and no Phase 10
+commit SHA is recorded here because none exists yet. The freeze still requires architecture closeout review, exact
+staging, staged-diff review, commit, push, exact-SHA green CI and final freeze confirmation.
