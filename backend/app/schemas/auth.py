@@ -18,6 +18,7 @@ import re
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.core.security import PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH
+from app.core.timezone import validate_iana_timezone
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -46,6 +47,11 @@ class SignupRequest(_EmailField, _PasswordField):
     name: str = Field(min_length=1, max_length=200)
     business_name: str = Field(min_length=1, max_length=200)
     business_timezone: str = Field(min_length=1, max_length=100)
+
+    @field_validator("business_timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        return validate_iana_timezone(value)
 
 
 class LoginRequest(_EmailField):

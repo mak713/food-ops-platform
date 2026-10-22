@@ -126,6 +126,7 @@ export class Tenant {
   tz = TZ;
   slug = "";
   private testNumber = "";
+  private ownAccountDeletion = false;
 
   constructor(
     readonly context: BrowserContext,
@@ -185,6 +186,17 @@ export class Tenant {
   /** Declare structured 4xx error codes this scenario intentionally provokes. */
   expectResponses(...codes: string[]) {
     codes.forEach((c) => this.expectedCodes.add(c));
+  }
+
+  /**
+   * Opt-in for a scenario whose subject IS account deletion (Phase 11): this scenario deletes
+   * its own tenant through the UI, so `finish()` skips its normal API deletion and instead
+   * requires — via direct SQL — that the User and Business rows are genuinely gone (the test
+   * fails, and the leftovers are removed, otherwise). Default scenarios are unaffected: their
+   * cleanup, leak detection and `tenant cleanup` assertion are unchanged.
+   */
+  expectOwnAccountDeletion() {
+    this.ownAccountDeletion = true;
   }
 
   note(msg: string) {
@@ -527,20 +539,25 @@ export class Tenant {
       await this.context.tracing.stop();
     }
     // Real account deletion: Business first, then User (session + CSRF still valid).
-    try {
-      const r = await this.api.send("delete", "/account", {
-        current_password: PASSWORD,
-        business_name_confirmation: this.businessName,
-      });
-      if (!r.ok) cleanup = `account delete failed ${r.status} ${JSON.stringify(r.body)}`;
-    } catch (e) {
-      cleanup = `account delete error ${(e as Error).message}`;
+    if (!this.ownAccountDeletion) {
+      try {
+        const r = await this.api.send("delete", "/account", {
+          current_password: PASSWORD,
+          business_name_confirmation: this.businessName,
+        });
+        if (!r.ok) cleanup = `account delete failed ${r.status} ${JSON.stringify(r.body)}`;
+      } catch (e) {
+        cleanup = `account delete error ${(e as Error).message}`;
+      }
     }
     const leftover = sql(
       `select (select count(*) from users where email='${this.email}'),
               (select count(*) from businesses where id='${this.businessId}')`,
     )[0];
     if (leftover[0] !== "0" || leftover[1] !== "0") {
+      if (this.ownAccountDeletion) {
+        cleanup = `scenario-owned account deletion left rows (users=${leftover[0]}, businesses=${leftover[1]})`;
+      }
       // Fall back to direct removal of ONLY this scenario's own tenant.
       try {
         sql(`delete from businesses where id='${this.businessId}'`);

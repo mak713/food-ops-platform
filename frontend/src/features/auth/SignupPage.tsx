@@ -4,9 +4,11 @@ import { useForm } from "react-hook-form";
 import { Link, Navigate, useNavigate } from "react-router-dom";
 import { z } from "zod";
 import { ApiError } from "../../api/client";
+import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "../../components/ui/button";
 import { authApi } from "./api";
 import { useAuth } from "./AuthContext";
+import { purgeTenantQueries } from "./tenantCache";
 
 // Mirrors the backend password policy (backend/app/core/security.py,
 // PASSWORD_MIN_LENGTH/PASSWORD_MAX_LENGTH) — no composition-class rules, passphrases and
@@ -29,6 +31,7 @@ const detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 export function SignupPage() {
   const navigate = useNavigate();
   const { refetchMe, isAuthenticated, isLoading } = useAuth();
+  const queryClient = useQueryClient();
 
   const {
     register,
@@ -42,6 +45,7 @@ export function SignupPage() {
   const mutation = useMutation({
     mutationFn: authApi.signup,
     onSuccess: async () => {
+      purgeTenantQueries(queryClient); // tenant-cache boundary (see LoginPage)
       await refetchMe();
       navigate("/app/dashboard", { replace: true });
     },
@@ -50,6 +54,13 @@ export function SignupPage() {
   if (!isLoading && isAuthenticated) {
     return <Navigate to="/app/dashboard" replace />;
   }
+
+  // The server validates the timezone as an IANA identifier (SET-002); show its message next
+  // to the field it concerns, not only in the generic banner.
+  const timezoneIssue =
+    mutation.error instanceof ApiError
+      ? mutation.error.body?.error.issues.find((i) => i.field === "business_timezone")
+      : undefined;
 
   return (
     <div className="mx-auto flex min-h-svh max-w-sm flex-col justify-center gap-6 p-8">
@@ -125,6 +136,11 @@ export function SignupPage() {
           />
           {errors.business_timezone && (
             <p className="text-xs text-destructive">{errors.business_timezone.message}</p>
+          )}
+          {timezoneIssue && (
+            <p role="alert" className="text-xs text-destructive">
+              {timezoneIssue.message}
+            </p>
           )}
         </div>
 

@@ -33,11 +33,33 @@
 // (Checkpoint 2 review, logout-state bug). resetQueries() is the API TanStack Query
 // documents specifically for resetting an *active* query to its initial state and
 // having it refetch — confirmed working end-to-end in the real app.
+//
+// Phase 11 (tenant-cache boundary): clearMe() above is untouched. In addition, this provider
+// owns the rule that no tenant data may outlive the principal that fetched it. `principalId`
+// is the authenticated user's id, or null once logged out / deleted / confirmed-401. When it
+// changes away from a non-null principal, every non-auth query is purged (tenantCache.ts) —
+// after the protected tree has been unmounted: `tenantCacheReady` is false for exactly the
+// render in which the principal differs from the principal the cache was last purged for, so
+// ProtectedRoute renders no screen (and therefore no tenant observer exists) until the purge
+// effect has run and recorded the new cache owner. That ordering is what makes the purge
+// safe and what prevents a previous tenant's data from flashing for the next one.
+//
+// A tenant mutation still pending across the boundary can run hook-level callbacks (e.g. a
+// `setQueryData`) after the purge, so the cache is also not "ready" while any such mutation is
+// outstanding; it is purged again when each one settles (see createCacheBoundary).
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { createContext, useContext, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import { ApiError } from "../../api/client";
 import { authApi, type MeResponse } from "./api";
+import { createCacheBoundary } from "./tenantCache";
 
 export const ME_QUERY_KEY = ["auth", "me"] as const;
 
@@ -46,6 +68,8 @@ interface AuthContextValue {
   isLoading: boolean;
   isAuthenticated: boolean;
   isUnauthenticated: boolean;
+  /** False while the tenant cache still belongs to a different principal (see header). */
+  tenantCacheReady: boolean;
   refetchMe: () => Promise<unknown>;
   clearMe: () => void;
 }
@@ -64,11 +88,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const isUnauthenticated = query.error instanceof ApiError && query.error.status === 401;
 
+  const principalId = query.data && !isUnauthenticated ? query.data.user.id : null;
+  const [boundary] = useState(() => createCacheBoundary(queryClient));
+  const { owner: cacheOwner, outstanding } = useSyncExternalStore(
+    boundary.subscribe,
+    boundary.getSnapshot,
+  );
+
+  useEffect(() => {
+    boundary.syncPrincipal(principalId);
+  }, [principalId, boundary]);
+
   const value: AuthContextValue = {
     me: query.data,
     isLoading: query.isLoading,
     isAuthenticated: Boolean(query.data) && !isUnauthenticated,
     isUnauthenticated,
+    tenantCacheReady: principalId === null || (cacheOwner === principalId && outstanding === 0),
     refetchMe: () => queryClient.invalidateQueries({ queryKey: ME_QUERY_KEY }),
     clearMe: () => queryClient.resetQueries({ queryKey: ME_QUERY_KEY }),
   };

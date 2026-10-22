@@ -7,7 +7,10 @@ cleanly — so this is real, working deletion now, not groundwork for later (Pha
 
 from __future__ import annotations
 
+import psycopg.errors
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from app.core import security
 from app.core.api_errors import ApiError
@@ -33,7 +36,37 @@ def delete_account(
     # (a User can't be deleted while their Business still exists). The new sessions/
     # password_reset_tokens tables FK to users.id with ON DELETE CASCADE, so deleting the
     # User cleans those up automatically; no separate session-revocation step is needed.
-    db.delete(business)
-    db.flush()
-    db.delete(user)
-    db.commit()
+    try:
+        db.delete(business)
+        db.flush()
+        db.delete(user)
+        db.commit()
+    except StaleDataError:
+        # Business carries optimistic versioning (Phase 11), so its ORM DELETE is
+        # `... WHERE id = ? AND version = ?`; a Settings write that committed after this
+        # request loaded the Business makes it match zero rows. Nothing was deleted.
+        db.rollback()
+        raise _delete_conflict() from None
+    except DBAPIError as exc:
+        # Only genuine lock contention is retryable: deadlock (40P01) and lock-not-available
+        # (55P03, e.g. a configured `lock_timeout`). Every other database error — including
+        # other OperationalErrors such as statement timeouts — keeps its existing behavior.
+        if isinstance(exc.orig, _RETRYABLE_CONTENTION_ERRORS):
+            db.rollback()
+            raise _delete_conflict() from None
+        raise
+
+
+_RETRYABLE_CONTENTION_ERRORS = (
+    psycopg.errors.DeadlockDetected,
+    psycopg.errors.LockNotAvailable,
+)
+
+
+def _delete_conflict() -> ApiError:
+    return ApiError(
+        409,
+        "ACCOUNT_DELETE_CONFLICT",
+        "Your account could not be deleted because other activity was in progress. "
+        "Nothing was deleted; please try again.",
+    )

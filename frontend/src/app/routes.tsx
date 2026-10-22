@@ -5,11 +5,11 @@ import { Button } from "../components/ui/button";
 import { authApi } from "../features/auth/api";
 import { useAuth } from "../features/auth/AuthContext";
 import { AnalyticsPage } from "../features/analytics/AnalyticsPage";
-import { AccountSettingsPage } from "../features/auth/AccountSettingsPage";
 import { LoginPage } from "../features/auth/LoginPage";
 import { PasswordResetConfirmPage } from "../features/auth/PasswordResetConfirmPage";
 import { PasswordResetRequestPage } from "../features/auth/PasswordResetRequestPage";
 import { ProtectedRoute } from "../features/auth/ProtectedRoute";
+import { SettingsPage } from "../features/settings/SettingsPage";
 import { SignupPage } from "../features/auth/SignupPage";
 import { CustomerDetailPage } from "../features/customers/CustomerDetailPage";
 import { CustomerFormPage } from "../features/customers/CustomerFormPage";
@@ -56,7 +56,8 @@ import { SurplusListPage } from "../features/surplus/SurplusListPage";
 // session (GET /api/v1/auth/me) — never from anything client-stored. Every other module
 // under §12.2 (Orders, Production, Customers, ...) is added when the phase that owns it
 // begins. Phase 9 replaces the Dashboard placeholder with the real Dashboard and adds the
-// Shopping List under Production. Phase 10 adds Analytics.
+// Shopping List under Production. Phase 10 adds Analytics. Phase 11 replaces the standalone
+// Account page with Settings (`/app/account` redirects to `/app/settings?area=account`).
 
 function AppLayout() {
   const { me, clearMe } = useAuth();
@@ -105,8 +106,8 @@ function AppLayout() {
           <Link to="/app/analytics" className="text-muted-foreground hover:text-foreground">
             Analytics
           </Link>
-          <Link to="/app/account" className="text-muted-foreground hover:text-foreground">
-            Account
+          <Link to="/app/settings" className="text-muted-foreground hover:text-foreground">
+            Settings
           </Link>
         </div>
         <Button
@@ -145,7 +146,9 @@ export const routes: RouteObject[] = [
           { index: true, element: <Navigate to="/app/dashboard" replace /> },
           { path: "dashboard", element: <DashboardPage /> },
           { path: "analytics", element: <AnalyticsPage /> },
-          { path: "account", element: <AccountSettingsPage /> },
+          { path: "settings", element: <SettingsPage /> },
+          // Compatibility: the former standalone Account page now lives in Settings.
+          { path: "account", element: <Navigate to="/app/settings?area=account" replace /> },
           { path: "customers", element: <CustomerListPage /> },
           { path: "customers/new", element: <CustomerFormPage /> },
           { path: "customers/:id", element: <CustomerDetailPage /> },

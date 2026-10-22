@@ -291,7 +291,10 @@ def classify_fulfillment(
     deadline = fulfillment_deadline_utc(fulfillment_date, fulfillment_time, business_timezone)
     if deadline is None:
         return FulfillmentTiming.ON_TRACK
-    if now_utc >= deadline - timedelta(minutes=warning_minutes):
+    # Difference-based form of `now_utc >= deadline - warning`: identical semantics (inclusive
+    # boundary) but it never subtracts a large window from a datetime, so an extreme-but-valid
+    # `warning_minutes` (any positive INTEGER) cannot overflow `datetime`.
+    if deadline - now_utc <= timedelta(minutes=warning_minutes):
         return FulfillmentTiming.AT_RISK
     return FulfillmentTiming.ON_TRACK
 

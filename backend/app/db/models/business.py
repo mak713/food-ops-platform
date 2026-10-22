@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import CheckConstraint, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, declared_attr, mapped_column, relationship
 
 from app.db.base import Base
 from app.db.columns import MONEY, RATIO
@@ -37,6 +37,15 @@ class Business(Base, TimestampMixin, VersionMixin):
             name="ck_businesses_shopping_horizon_days_allowed",
         ),
     )
+
+    # Optimistic concurrency for Business Settings (Spec §8.33/§17.8; Phase 11 Revision 2):
+    # applied per-class exactly like Customer/Product/Order (ORM-only — the `version`
+    # column already exists, so no migration). Consequence: the ORM now emits
+    # `UPDATE/DELETE ... WHERE id = ? AND version = ?` for Business, so an account deletion
+    # racing a Settings write raises `StaleDataError`, which `account_service` translates.
+    @declared_attr.directive
+    def __mapper_args__(cls) -> dict:
+        return {"version_id_col": cls.version}
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     owner_user_id: Mapped[uuid.UUID] = mapped_column(

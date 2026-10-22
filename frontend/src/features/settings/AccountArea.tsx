@@ -1,16 +1,93 @@
-// Minimal account settings UI (Phase 2 plan §2): authenticated password change, and full
-// account/business deletion behind current-password + exact business-name confirmation
-// (Phase 2 plan §7). Business Settings CRUD (name/timezone/etc.) is out of Phase 2 scope.
+// Account area of Settings (Spec AUTH-005/007/008): the owner's display name, the read-only
+// login email, authenticated password change, and full account deletion behind current
+// password + exact business-name confirmation.
+//
+// Phase 11 scope: the owner edits their *name* only. The login email is shown but cannot be
+// changed (no email-change/verification workflow exists), and the password flow is the
+// unchanged Phase 2 one, relocated here from the former standalone Account page.
 
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useMutation } from "@tanstack/react-query";
-import { useForm } from "react-hook-form";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useForm, useWatch } from "react-hook-form";
 import { useNavigate } from "react-router-dom";
 import { z } from "zod";
 import { ApiError } from "../../api/client";
+import { FormField } from "../../components/shared/FormField";
 import { Button } from "../../components/ui/button";
-import { authApi } from "./api";
-import { useAuth } from "./AuthContext";
+import { Input } from "../../components/ui/input";
+import { authApi, type MeResponse } from "../auth/api";
+import { ME_QUERY_KEY, useAuth } from "../auth/AuthContext";
+import { settingsApi } from "./api";
+import { applyServerFieldErrors, errorMessage } from "./shared";
+
+// --------------------------------------------------------------------------- owner profile
+
+const ownerSchema = z.object({ name: z.string().trim().min(1, "Name is required") });
+type OwnerValues = z.infer<typeof ownerSchema>;
+
+function OwnerProfileForm({ name, email }: { name: string; email: string }) {
+  const queryClient = useQueryClient();
+  const {
+    register,
+    handleSubmit,
+    reset,
+    setError,
+    control,
+    formState: { errors },
+  } = useForm<OwnerValues>({ resolver: zodResolver(ownerSchema), defaultValues: { name } });
+
+  const mutation = useMutation({
+    mutationFn: (value: string) => settingsApi.updateOwner(value),
+    onSuccess: (saved) => {
+      queryClient.setQueryData<MeResponse>(ME_QUERY_KEY, (old) =>
+        old ? { ...old, user: { ...old.user, name: saved.name } } : old,
+      );
+      void queryClient.invalidateQueries({ queryKey: ME_QUERY_KEY });
+      reset({ name: saved.name });
+    },
+    onError: (error) => applyServerFieldErrors(error, setError, ["name"]),
+  });
+
+  const typedName = useWatch({ control, name: "name" });
+  const dirty = (typedName ?? "").trim() !== name;
+
+  return (
+    <form
+      className="flex max-w-sm flex-col gap-4"
+      noValidate
+      onSubmit={handleSubmit((values) => mutation.mutate(values.name.trim()))}
+    >
+      <FormField id="owner_name" label="Your name" error={errors.name?.message}>
+        <Input id="owner_name" autoComplete="name" {...register("name")} />
+      </FormField>
+      <div className="flex flex-col gap-1">
+        <span className="text-sm font-medium">Login email</span>
+        <p className="text-sm" data-testid="owner-email">
+          {email}
+        </p>
+        <p className="text-xs text-muted-foreground">Your login email can't be changed here.</p>
+      </div>
+      {mutation.isError &&
+        !(mutation.error instanceof ApiError && mutation.error.status === 422) && (
+          <p role="alert" className="text-sm text-destructive">
+            {errorMessage(mutation.error)}
+          </p>
+        )}
+      <div className="flex flex-wrap items-center gap-3">
+        <Button type="submit" disabled={mutation.isPending || !dirty} className="w-fit">
+          {mutation.isPending ? "Saving…" : "Save name"}
+        </Button>
+        {mutation.isSuccess && !dirty && (
+          <p role="status" className="text-sm text-muted-foreground">
+            Saved
+          </p>
+        )}
+      </div>
+    </form>
+  );
+}
+
+// ------------------------------------------------------------------------ change password
 
 const changePasswordSchema = z.object({
   current_password: z.string().min(1, "Current password is required"),
@@ -77,7 +154,11 @@ function ChangePasswordForm() {
             : "Something went wrong. Please try again."}
         </p>
       )}
-      {mutation.isSuccess && <p className="text-sm">Password changed.</p>}
+      {mutation.isSuccess && (
+        <p role="status" className="text-sm">
+          Password changed.
+        </p>
+      )}
 
       <Button type="submit" disabled={mutation.isPending} className="w-fit">
         {mutation.isPending ? "Changing…" : "Change password"}
@@ -85,6 +166,8 @@ function ChangePasswordForm() {
     </form>
   );
 }
+
+// ------------------------------------------------------------------------ delete account
 
 function deleteAccountSchema(businessName: string) {
   return z.object({
@@ -108,6 +191,8 @@ function DeleteAccountForm({ businessName }: { businessName: string }) {
   const mutation = useMutation({
     mutationFn: authApi.deleteAccount,
     onSuccess: () => {
+      // clearMe() resets the auth query; AuthProvider then purges every tenant query once
+      // the principal is gone (tenant-cache boundary), so nothing of this Business survives.
       clearMe();
       navigate("/login", { replace: true });
     },
@@ -158,33 +243,41 @@ function DeleteAccountForm({ businessName }: { businessName: string }) {
         </p>
       )}
 
-      <Button
-        type="submit"
-        variant="destructive"
-        disabled={mutation.isPending}
-        className="w-fit"
-      >
+      <Button type="submit" variant="destructive" disabled={mutation.isPending} className="w-fit">
         {mutation.isPending ? "Deleting…" : "Delete account"}
       </Button>
     </form>
   );
 }
 
-export function AccountSettingsPage() {
+// ------------------------------------------------------------------------------- the area
+
+export function AccountArea() {
   const { me } = useAuth();
 
   return (
     <div className="flex flex-col gap-10">
-      <h1 className="text-xl font-semibold">Account</h1>
+      {me && (
+        <section aria-labelledby="owner-profile-heading" className="flex flex-col gap-4">
+          <h3 id="owner-profile-heading" className="text-sm font-semibold text-muted-foreground">
+            Owner profile
+          </h3>
+          <OwnerProfileForm name={me.user.name} email={me.user.email} />
+        </section>
+      )}
 
-      <section className="flex flex-col gap-4">
-        <h2 className="text-sm font-semibold text-muted-foreground">Change password</h2>
+      <section aria-labelledby="change-password-heading" className="flex flex-col gap-4">
+        <h3 id="change-password-heading" className="text-sm font-semibold text-muted-foreground">
+          Change password
+        </h3>
         <ChangePasswordForm />
       </section>
 
       {me && (
-        <section className="flex flex-col gap-4">
-          <h2 className="text-sm font-semibold text-destructive">Delete account</h2>
+        <section aria-labelledby="delete-account-heading" className="flex flex-col gap-4">
+          <h3 id="delete-account-heading" className="text-sm font-semibold text-destructive">
+            Delete account
+          </h3>
           <DeleteAccountForm businessName={me.business.name} />
         </section>
       )}

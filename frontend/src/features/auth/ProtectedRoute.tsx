@@ -11,7 +11,7 @@ import { Navigate, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "./AuthContext";
 
 export function ProtectedRoute() {
-  const { isLoading, isAuthenticated, isUnauthenticated, refetchMe } = useAuth();
+  const { isLoading, isAuthenticated, isUnauthenticated, tenantCacheReady, refetchMe } = useAuth();
   const location = useLocation();
 
   if (isLoading) {
@@ -19,6 +19,11 @@ export function ProtectedRoute() {
   }
 
   if (isAuthenticated) {
+    // Phase 11: never render a protected screen while the tenant cache still belongs to a
+    // previous principal (AuthContext purges it and then marks the cache ready).
+    if (!tenantCacheReady) {
+      return <div className="p-8 text-sm text-muted-foreground">Loading…</div>;
+    }
     return <Outlet />;
   }
 

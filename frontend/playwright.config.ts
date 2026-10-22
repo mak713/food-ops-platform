@@ -7,9 +7,16 @@ export default defineConfig({
   testDir: "./e2e",
   // The Phase 8 acceptance suite is a local regression harness (Docker PostgreSQL,
   // dev stack, test-tenant lifecycle); run it explicitly via playwright.phase8.config.ts
-  // (Phase 9, Order Completion and Phase 10 Analytics likewise:
-  // playwright.phase9.config.ts, playwright.completion.config.ts, playwright.phase10.config.ts).
-  testIgnore: ["**/phase8/**", "**/phase9/**", "**/phase10/**", "**/completion/**"],
+  // (Phase 9, Order Completion, Phase 10 Analytics and Phase 11 Settings likewise:
+  // playwright.phase9.config.ts, playwright.completion.config.ts, playwright.phase10.config.ts,
+  // playwright.phase11.config.ts).
+  testIgnore: [
+    "**/phase8/**",
+    "**/phase9/**",
+    "**/phase10/**",
+    "**/phase11/**",
+    "**/completion/**",
+  ],
   fullyParallel: true,
   webServer: {
     command: "npm run dev",

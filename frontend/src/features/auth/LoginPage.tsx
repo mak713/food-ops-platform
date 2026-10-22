@@ -4,9 +4,11 @@ import { useForm } from "react-hook-form";
 import { Link, Navigate, useNavigate, useSearchParams } from "react-router-dom";
 import { z } from "zod";
 import { ApiError } from "../../api/client";
+import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "../../components/ui/button";
 import { authApi } from "./api";
 import { useAuth } from "./AuthContext";
+import { purgeTenantQueries } from "./tenantCache";
 
 const schema = z.object({
   email: z.string().min(1, "Email is required"),
@@ -33,6 +35,7 @@ export function LoginPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { refetchMe, isAuthenticated, isLoading } = useAuth();
+  const queryClient = useQueryClient();
   const next = resolveNextPath(searchParams.get("next"));
 
   const {
@@ -44,6 +47,9 @@ export function LoginPage() {
   const mutation = useMutation({
     mutationFn: authApi.login,
     onSuccess: async () => {
+      // Defense in depth for the tenant-cache boundary (AuthContext also purges on any
+      // principal change): nothing from a previous session may be visible to this one.
+      purgeTenantQueries(queryClient);
       await refetchMe();
       navigate(next, { replace: true });
     },

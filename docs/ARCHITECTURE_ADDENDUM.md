@@ -1977,3 +1977,243 @@ after Phase 10 is formally frozen.**
 Phase 10 is implemented and independently reviewed but is **not formally frozen by this entry**, and no Phase 10
 commit SHA is recorded here because none exists yet. The freeze still requires architecture closeout review, exact
 staging, staged-diff review, commit, push, exact-SHA green CI and final freeze confirmation.
+
+## Phase 11 Architecture Decisions
+
+Phase 11 implements the Spec's Settings and Account completion (§6.15 SET-001..005, AUTH-005/007/008, §8.33/§17.8
+Business optimistic concurrency, SEC-001/002, AC-AUTH-007/008, AC-SEC-006). It adds a Settings API and UI over
+columns that already exist on `businesses` and `users`, so it needs **no migration**. It also hardens three
+cross-cutting concerns the new surface exposed: server-side timezone validation, the authenticated client cache
+boundary, and full-tenant deletion under contention. Its frozen predecessor/base is the Phase 10 commit
+`123878a8d270dfeae34cad5723fb57443803b26c`.
+
+### ADR-159 — Settings Resource, Business Optimistic Concurrency and Owner Profile
+
+Settings is one session-derived resource, implemented in `app.api.v1.settings` → `app.services.settings_service`
+with schemas in `app.schemas.settings`:
+
+- `GET /api/v1/settings` returns the authenticated Business's settings (`id`, `name`, `business_type`,
+  `contact_phone`, `contact_email`, `address_text`, `timezone`, `default_labor_rate`,
+  `target_contribution_margin`, `fulfillment_warning_minutes`, `shopping_horizon_days`, `version`).
+- `PATCH /api/v1/settings/business` is a partial update: an absent field is unchanged, an explicit `null` clears a
+  nullable field, and an explicit `null` for a NOT NULL field is a normal `422`. It requires the caller's loaded
+  `version`.
+- `PATCH /api/v1/settings/owner` updates the authenticated owner's display `name` only.
+
+The Business and User are derived solely from the authenticated session (`get_current_business` /
+`get_current_user`, SEC-001/002). No path, query or body field selects a tenant: `business_id`, `owner_user_id`, `id`
+and `default_fulfillment_method` in a request body are ignored by the schemas (Pydantic `extra="ignore"`) and the
+service applies only `model_dump(exclude_unset=True)` fields of the fixed schema, so excluded fields can never reach
+`setattr`. Mutations require the full CSRF check.
+
+`Business` gains `version_id_col` (the established per-class `declared_attr.directive` wiring of ADR-100; ORM-only,
+because the `version` column already exists). `update_business_settings` calls `check_version` first — **even for
+a request that would change nothing** — then assigns only fields whose value actually differs, commits through
+`commit_or_raise_stale` and returns the refreshed record. A stale write returns the structured
+`409 STALE_VERSION` (`details.current_version`); version and `updated_at` change only on a real change. Concurrency
+is **whole-Business-record**: two editors changing *different* Business settings from the same loaded version still
+conflict, and the loser refreshes and re-applies. The frontend submits the version of the snapshot a form was loaded
+or last refreshed with and deliberately ignores later background refetches, so unsaved edits are never silently
+re-based onto a newer version.
+
+`User` is **not** wired as an optimistic-concurrency aggregate: doing so would change the existing login-rehash,
+password-change and password-reset behavior. The owner-name edit is intentionally **last-write-wins** with no
+`version` in its contract. The login email is displayed read-only; there is **no email-change workflow**, no
+verification flow and no secondary email. Password change/reset and account deletion keep their existing endpoints
+and semantics (ADR-095).
+
+### ADR-160 — Settings Validation and Representation
+
+- **One shared IANA timezone validator** (`app.core.timezone.validate_iana_timezone`) is used by both
+  `SignupRequest.business_timezone` and the Settings update. It trims, then requires case-exact membership in
+  `zoneinfo.available_timezones()` **and** a successful `ZoneInfo` load. Legacy aliases the tz database ships
+  (for example `US/Pacific`, `EST`) are valid; free text such as `Mars/Phobos`, `localtime`, wrong-case names or
+  path-like strings are rejected with the normal structured `422`. This also closes a Phase 2 gap: signup previously
+  accepted any non-empty string, and roughly 38 consumers call `ZoneInfo(business.timezone)` unguarded. The frontend
+  timezone control is an editable text input with a `<datalist>` of browser-supplied suggestions; suggestions are
+  **non-authoritative** and never a closed list — the backend is authoritative.
+- `default_fulfillment_method` remains **outside** Phase 11 Settings: not exposed, not removed, not mutated.
+- **Target contribution margin** is stored and transferred as a fixed-precision ratio (`NUMERIC(9,6)`, `0 ≤ x < 1`,
+  at most 6 decimals, never silently rounded; `null` = no target). The UI displays and accepts a **percentage**
+  (at most 4 decimals, `0 ≤ p < 100`). The conversion is a pure **decimal-string shift** of two places
+  (`62.5` ↔ `0.625000`) and never passes through JavaScript `Number`; the backend accepts only the ratio.
+- `default_labor_rate` is a non-negative `NUMERIC(14,2)` value (at most two decimals, not rounded).
+  `shopping_horizon_days` is exactly 3 or 7 (SET-004). `fulfillment_warning_minutes` retains the Spec's `> 0`
+  semantics; its **only upper bound is the PostgreSQL `INTEGER` representability ceiling (2,147,483,647)**, a
+  persistence limit and not a product rule. Both integer fields are strict integers.
+- Text fields are trimmed; blank optional strings become `null`. **No arbitrary Business-setting limits are
+  invented**: `business_type`, `contact_phone` and `address_text` have no length limit because the schema has none.
+  The only length bounds applied are the existing conventions for the same fields elsewhere (business/owner name
+  1–200 characters, contact email ≤ 254 with the existing shape check and its case preserved, timezone ≤ 100).
+- Frontend responses are validated strictly (zod); a body that is not a Settings document is an error, never partial
+  UI.
+
+### ADR-161 — Current Settings Versus Historical Truth; Timezone-Change Semantics
+
+Settings are **current configuration**. They may influence future and current operational calculations (SET-005) and
+never rewrite completed historical financial truth (ANA-011). The Settings service writes only `businesses` /
+`users` columns and performs no recalculation.
+
+- **Labor rate.** A change does **not** mass-recalculate existing Production Requirements: an existing planned
+  estimate remains its ADR-131 snapshot until an ordinary recalculation event. **Future Production Starts use the
+  current rate**; every Production Run's `labor_rate_snapshot` and actual labor cost, the run/allocation rows and
+  every completed Order's `OrderCostAllocation` rows stay immutable, so Analytics Revenue, Direct Cost and
+  Contribution do not move. The UI states that the new value applies to future production starts and subsequent
+  recalculations and that existing runs, completed costs and already-calculated planned estimates are not rewritten.
+- **Timezone.** The Business timezone **may be changed at any time**. The change rewrites no persisted timestamp or
+  historical financial fact (`completed_at`, ledger rows, price/cost/run snapshots), introduces **no historical
+  timezone snapshot**, performs no recalculation and is not blocked by active work. Current Business-local
+  interpretation — "today", Dashboard and production timing, Shopping List business-local dates, Analytics period
+  grouping, and existing wall-clock fulfillment dates/times — uses the **current** timezone wherever the existing
+  architecture already defines Business-local interpretation (ADR-129, ADR-154). Existing wall-clock operational
+  values may therefore be interpreted differently after a change, and the UI shows an explicit confirmation naming
+  these effects before a changed timezone is saved.
+- **Immediate effects.** Fulfillment warning minutes feed the Dashboard fulfillment-risk classification and the
+  default Shopping List horizon feeds the Shopping List default range; both take effect on the next read.
+
+### ADR-162 — Dashboard Fulfillment-Risk Comparison Is Overflow-Safe
+
+`classify_fulfillment` previously evaluated `now >= deadline - warning`. For a valid, storable but extreme positive
+warning window the subtraction could overflow `datetime` and fail the whole tenant's Dashboard. It now evaluates the
+mathematically identical `deadline - now <= warning`, whose operands are always valid and whose difference always
+fits a `timedelta`. This is a **behavior-preserving hardening, not a new business rule**: the inclusive boundary, the
+"already passed earlier today is still at risk" behavior, the Ready/date-only/overdue precedence and every existing
+Dashboard test are unchanged. A boundary-equivalence test and extreme-value tests cover it.
+
+### ADR-163 — Authenticated Tenant-Cache Boundary
+
+The SPA uses **one shared TanStack `QueryClient`** and tenant query keys are not individually tenant-prefixed, so
+nothing in the client otherwise prevents one Business's cached data from outliving its session. An explicit
+authenticated-principal cache boundary (`frontend/src/features/auth/tenantCache.ts`, `AuthContext.tsx`,
+`ProtectedRoute.tsx`) provides it:
+
+- **Classification.** Every query whose root key is not `"auth"` is tenant-owned (a generic predicate, not a list, so
+  a future root is covered). `["auth","me"]` keeps its separate, documented behavior: it is reset by `clearMe()`
+  (`resetQueries`) and is never removed. `queryClient.clear()` is **deliberately not used**, because the actively
+  observed auth query needs that established `resetQueries` behavior (removing it recreates the stale-authenticated
+  `me` / login-redirect-loop defect).
+- **Purge.** `purgeTenantQueries` cancels and removes all tenant queries and removes settled mutation results. It
+  cannot cancel a mutation that is executing, so it leaves pending mutations in place.
+- **Principal gate.** `AuthProvider` derives `principalId` (the user id; `null` when logged out, deleted or on a
+  confirmed 401, so a 401 beats stale cached data). `tenantCacheReady` is true only when `principalId` is `null` or
+  the cache boundary's owner equals `principalId` **and no old-principal mutation is outstanding**. In the render in
+  which the principal first differs, the owner is still the previous one, so `ProtectedRoute` renders only its
+  loading placeholder: every protected screen and tenant observer unmounts in that commit and nothing of the previous
+  tenant can be painted. This is also what makes purging safe when `/me` switches directly from one principal to
+  another without an intermediate unauthenticated render.
+- **Pending old-principal mutations.** TanStack runs a mutation's hook-level callbacks (`onSuccess`, `onError`,
+  `onSettled` passed to `useMutation`, for example Settings' `setQueryData`) when it settles even after its component
+  unmounted and even if it was removed from the `MutationCache`; those mutations are **not canceled**. When a
+  principal is left (logout, deletion, 401 or A → B), `createCacheBoundary` therefore purges, then **tracks every
+  mutation still pending**. The next principal's protected tree stays closed — across `A → nobody → B`, and counting a
+  mutation once across overlapping boundaries — until each tracked mutation has left `pending` (TanStack leaves
+  `pending` only after all callbacks finished). After **each** one settles, tenant state is purged **again**, removing
+  whatever its late callbacks wrote and its own result. Only when no tracked mutation remains does `tenantCacheReady`
+  become true and the new principal's protected tree open. A late old-principal callback therefore cannot reintroduce
+  previous-tenant data.
+- **Liveness tradeoff (deliberate).** If an old-principal mutation stays pending indefinitely (a request that never
+  settles, or a mutation paused offline), the next principal's protected tenant UI stays gated on its loading state
+  until it settles or fails. Security is preferred over opening early and risking cross-tenant cache exposure.
+- **Other transitions.** Logout and account deletion call `clearMe()` and navigate to login; the principal change
+  then triggers the boundary. Login and signup additionally purge tenant queries before refetching `me` (defense in
+  depth). After a successful **timezone change** every inactive tenant query is removed, active ones are invalidated
+  and refetched, and `["auth","me"]` is invalidated separately, so data derived under the old timezone cannot be
+  reopened from cache.
+
+### ADR-164 — Full-Tenant Account Deletion Under Contention
+
+The strong destructive confirmation is unchanged: authenticated session, CSRF, current password and exact
+business-name confirmation. The Business is deleted before the User, the whole tenant graph cascades according to the
+frozen schema, and the deletion is a single controlled transaction. Because `Business` is now versioned, its ORM
+`DELETE` is `... WHERE id = ? AND version = ?`, so a Settings write that commits first makes the delete match zero
+rows. `account_service.delete_account` translates **only** three conditions into the structured, retryable
+`409 ACCOUNT_DELETE_CONFLICT` — PostgreSQL `40P01` (`DeadlockDetected`), PostgreSQL `55P03` (`LockNotAvailable`, for
+example a `lock_timeout`) and the Business-version `StaleDataError` — and rolls back **completely** before returning
+it, so nothing is deleted and a retry can succeed. Every other database failure (`CheckViolation`,
+`ForeignKeyViolation`, `QueryCanceled`, `SerializationFailure`, connection errors, ...) propagates unchanged and is
+never swallowed or rewritten. On success the response clears the authentication cookies and the client clears
+authentication state and, through ADR-163, the tenant cache; on a conflict the session and UI are left intact.
+Realistic-graph deletion over HTTP (every tenant table populated, a second tenant untouched) is part of the
+acceptance coverage.
+
+### ADR-165 — Settings Frontend
+
+`/app/settings` is the canonical route and primary-navigation item ("Settings" replaces the standalone Account item).
+It has four URL-synced areas (`?area=profile|costing|operations|account`, default Business Profile) in an accessible
+tablist with keyboard navigation: **Business Profile** (name, type, contact phone/email, address, timezone with the
+confirmation above), **Costing & Pricing** (default labor rate; target contribution margin as a percentage),
+**Operations** (fulfillment warning minutes; default Shopping List horizon of 3 or 7 days) and **Account** (editable
+owner name, read-only login email, and the existing password-change and account-deletion workflows relocated
+unchanged in behavior). Each panel has a static heading so it renders without waiting for data; the Business
+Settings query is enabled only while a Business area is showing, so the Account area needs no Settings request.
+`/app/account` remains as a compatibility redirect to `/app/settings?area=account`. Each Business form saves only
+changed fields with its loaded version, maps server field errors, and offers stale-edit recovery on `409
+STALE_VERSION`. The 375 px no-document-horizontal-overflow protection is preserved and tested.
+
+## Phase 11 Completion Status
+
+Phase 11 (Settings and Account completion) is implemented and has passed independent pre-commit review, per ADR-159
+through ADR-165 above. Its frozen predecessor/base is the Phase 10 — Analytics commit
+`123878a8d270dfeae34cad5723fb57443803b26c`.
+
+**Scope delivered:** Business Profile Settings; Costing & Pricing Settings; Operations Settings; Account/profile
+completion (owner name, read-only email, password change and controlled deletion in one Account area); the shared
+server-side IANA timezone validator (also applied to signup); Business optimistic concurrency with stale-edit
+recovery; the historical-immutability behavior for labor-rate and timezone changes; the overflow-safe Dashboard
+fulfillment-risk comparison; the authenticated tenant-cache boundary, including the pending-old-principal-mutation
+gate; controlled full-tenant deletion hardening; the `/app/settings` page with the `/app/account` redirect; and the
+dedicated Phase 11 Playwright acceptance suite (`frontend/e2e/phase11/`, run via
+`frontend/playwright.phase11.config.ts`; the default configuration ignores it), including an additive, opt-in
+`expectOwnAccountDeletion()` harness helper for the deletion scenario.
+
+Phase 11 introduced **no domain migration** and **no new dependency**, and no frozen Phase 1–10 behavior was changed
+other than the behavior-preserving Dashboard comparison (ADR-162), the signup timezone validation (ADR-160), the
+Business version wiring (ADR-159), the authenticated-shell changes that implement the cache boundary
+(`AuthContext`, `ProtectedRoute`, login and signup — ADR-163), the narrow deletion-contention translation
+(ADR-164) and the relocation of the Account page into Settings. It adds **no email-change
+workflow**, **no `default_fulfillment_method` Settings exposure**, no generic settings/key-value infrastructure and
+**no Phase 12 work**.
+
+**Verification state (as recorded; counts are exactly those observed):**
+
+- Backend, verified before the frontend-only pending-mutation remediation: focused Phase 11 tests **137 passed**;
+  full suite **1351 passed**; Phase 2 auth/schema/tenant regressions **129 passed**; `ruff check` and
+  `ruff format --check` clean; `alembic check` clean. The remediation changed **no backend file**, so the backend was
+  **not rerun** after it.
+- Frontend, after the remediation: focused tenant-cache/Settings/auth/ratio Vitest **117 passed**; full Vitest
+  **383 passed**; TypeScript clean; the production build succeeds; ESLint reports zero errors (8 pre-existing
+  warnings).
+- Phase 11 Playwright, after the remediation: **8/8 on three consecutive full runs** plus a reversed-order run
+  **8/8**. T128 proves that a Settings mutation begun under Business A and held pending across logout/login cannot
+  expose its late result to Business B; T126 proves logout→login and delete→login tenant-cache isolation with delayed
+  responses.
+- Frozen browser regressions after the remediation: Phase 8 **18/18**; Phase 9 **3/3** (first post-remediation run);
+  Order Completion **4/4**; Phase 10 **4/4**; default smoke + tenant-security **2/2**.
+- Release-blocking coverage includes historical immutability after labor-rate and timezone changes (whole-row
+  fingerprints of runs, allocations, Orders, lines, ledger and inventory, and byte-identical Analytics), Business
+  concurrency (stale version, racing writers, whole-record conflict), tenant isolation of the Settings endpoints,
+  realistic full-graph deletion and the three translated contention conditions, the tenant-cache boundary including
+  the pending-old-principal-mutation cases (failing against the pre-remediation code and passing after the fix), and
+  a 375 px document-overflow assertion.
+
+**Observed verification history (disclosed, not unresolved product defects):**
+
+- During the earlier pre-remediation verification, Phase 9 initially ran 2/3 because T92 hit the previously
+  observed Order Entry preview timing/validation issue (a Phase 8 run had shown it too); T92 then passed alone and
+  Phase 9 reran 3/3.
+- The first T126 run failed because of a defect in the newly written test's leak watcher (it kept tenant A's marker
+  armed when A legitimately logged back in); the watcher was corrected and T126 then passed in all later runs.
+- During the remediation, the first T128 browser run passed its test body but failed teardown because the new test
+  left Business B authenticated in the shared browser context; the test cleanup was corrected and all subsequent
+  repeated and reversed runs passed.
+
+**Not included in Phase 11** (deferred): email change or verification; account-recovery redesign; multiple owners,
+employees, memberships or RBAC; customer accounts; billing or payment-provider settings; multi-currency;
+accounting/tax settings; notification preferences; themes; AI settings; multiple locations; suppliers and purchase
+orders; packaging inventory; integrations; a generic settings or audit framework; exposure of
+`default_fulfillment_method`; and seed/demo expansion (Phase 12). **Phase 12 begins only after Phase 11 is formally
+frozen.**
+
+Phase 11 is implemented and independently pre-commit reviewed but is **not yet formally frozen**. **No Phase 11
+commit SHA exists yet.** Formal freeze still requires exact staging, independent staged-diff review, commit, push,
+exact-SHA green CI and final freeze confirmation.
